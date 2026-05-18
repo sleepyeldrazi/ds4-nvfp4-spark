@@ -114,6 +114,108 @@ If you want to regenerate GGUF files or collect a new imatrix, see
 model-building work and can take a long time on the full DeepSeek V4 Flash
 weights.
 
+## REAP Compact Pruning
+
+This fork adds a DS4-native REAP path for the original DeepSeek V4 Flash GGUF.
+The flow is deliberately split into two phases:
+
+1. Observe routed expert activation on one or more rendered prompt datasets.
+2. Aggregate those observation JSON files and physically remove low-score routed
+   experts from the GGUF.
+
+Hash-routed layers `0..2` are always preserved. Layers `3..42` are pruned by
+default. With `--compression-ratio 0.5`, the original 256 routed experts become
+128 kept experts per pruned layer. The pruner copies quantized expert byte
+ranges directly, so the existing routed expert quantization is preserved. Q2
+expert tensors stay Q2/IQ2, and a GGUF whose whole routed expert tensors are
+Q4_K will also stay Q4_K. Per-expert mixed 2-bit/4-bit storage is not
+materialized by the current `ds4-compact-v1` layout. If the input GGUF was
+already produced by a separate mixed-quant writer, use
+`tools/remap_existing_mixed_per_expert_quant.py` to map those already-Q4_K
+original expert ids through the REAP pruning plan.
+
+Collect separated observations:
+
+```sh
+./ds4 \
+  -m /Users/eouya/LLM/models/ds4/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf \
+  --ctx 256 \
+  --reap-observe-dataset examples/reap_datasets/korean_smoke.txt \
+  --reap-observe-out gguf/reap-observations/korean_smoke.obs.json \
+  --reap-observe-max-prompts 1 \
+  --reap-observe-max-tokens 32
+
+./ds4 \
+  -m /Users/eouya/LLM/models/ds4/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf \
+  --ctx 256 \
+  --reap-observe-dataset examples/reap_datasets/code_smoke.txt \
+  --reap-observe-out gguf/reap-observations/code_smoke.obs.json \
+  --reap-observe-max-prompts 1 \
+  --reap-observe-max-tokens 32
+```
+
+Aggregate observations and write a compact 50% REAP GGUF:
+
+```sh
+tools/prune.py \
+  --input-gguf /Users/eouya/LLM/models/ds4/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf \
+  --observations \
+    gguf/reap-observations/korean_smoke.obs.json \
+    gguf/reap-observations/code_smoke.obs.json \
+  --output-gguf gguf/DeepSeek-V4-Flash-REAP50-DS4-compact-IQ2XXS.gguf \
+  --plan-out gguf/reap-observations/reap50_plan.json \
+  --compression-ratio 0.5 \
+  --skip-layers 0-2 \
+  --prune-layers 3-42 \
+  --overwrite
+```
+
+Optional: prepare a per-expert 4-bit candidate plan from Korean-focused
+metadata when the source GGUF is already mixed before REAP. This does not pick
+new Q4_K experts. It preserves/remaps the source manifest so the already-upgraded
+experts that survive pruning keep their post-prune compact slot ids.
+
+```sh
+tools/remap_existing_mixed_per_expert_quant.py \
+  --reap-plan gguf/reap-observations/reap50_plan.json \
+  --source-manifest examples/reap_mixed_quant/source_already_mixed_q4_manifest.example.json \
+  --output gguf/reap-observations/source_already_mixed_q4_remapped.json
+```
+
+The source manifest should describe original pre-prune expert ids that are
+already Q4_K in the input artifact:
+
+```json
+{
+  "format": "ds4_existing_mixed_per_expert_quant_manifest",
+  "format_version": 1,
+  "target_quant": "q4_k",
+  "layers": {
+    "3": {
+      "q4_experts_original_ids": [12, 98, 143]
+    }
+  }
+}
+```
+
+Inspect and run the pruned GGUF:
+
+```sh
+./ds4 -m gguf/DeepSeek-V4-Flash-REAP50-DS4-compact-IQ2XXS.gguf --inspect
+
+./ds4 \
+  -m gguf/DeepSeek-V4-Flash-REAP50-DS4-compact-IQ2XXS.gguf \
+  --ctx 512 --nothink --temp 0 -n 16 \
+  -p "are you deepseek?"
+```
+
+The smoke run in this checkout produced a 46.98 GiB compact GGUF from the 80.76
+GiB original q2-imatrix GGUF and loaded with:
+
+```text
+REAP runtime metadata enabled: hash_preserved=3 router_masked=40 moe_disabled=0 layout=ds4-compact-v1
+```
+
 `./download_model.sh mtp` fetches the optional speculative decoding support
 GGUF. It can be used with q2-imatrix, q4-imatrix, q2, and q4, but must be
 enabled explicitly with `--mtp`. The current MTP/speculative decoding path is

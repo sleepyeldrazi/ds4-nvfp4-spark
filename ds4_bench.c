@@ -271,7 +271,7 @@ static int next_frontier(const bench_config *c, int cur) {
     return next;
 }
 
-static void log_context_memory(ds4_backend backend, int ctx_size) {
+static ds4_context_memory log_context_memory(ds4_backend backend, int ctx_size) {
     ds4_context_memory m = ds4_context_memory_estimate(backend, ctx_size);
     fprintf(stderr,
             "ds4-bench: context buffers %.2f MiB (ctx=%d, backend=%s, prefill_chunk=%u, raw_kv_rows=%u, compressed_kv_rows=%u)\n",
@@ -281,11 +281,12 @@ static void log_context_memory(ds4_backend backend, int ctx_size) {
             m.prefill_cap,
             m.raw_cap,
             m.comp_cap);
+    return m;
 }
 
 int main(int argc, char **argv) {
     bench_config cfg = parse_options(argc, argv);
-    log_context_memory(cfg.backend, cfg.ctx_alloc);
+    const ds4_context_memory runtime_memory = log_context_memory(cfg.backend, cfg.ctx_alloc);
 
     ds4_engine_options opt = {
         .model_path = cfg.model_path,
@@ -335,7 +336,7 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
-    fprintf(out, "ctx_tokens,prefill_tokens,prefill_tps,gen_tokens,gen_tps,kvcache_bytes\n");
+    fprintf(out, "ctx_tokens,prefill_tokens,prefill_tps,gen_tokens,gen_tps,snapshot_bytes,runtime_context_bytes\n");
     fflush(out);
 
     const int eos = ds4_token_eos(engine);
@@ -397,13 +398,14 @@ int main(int argc, char **argv) {
 
         const double gen_sec = gen_t1 - gen_t0;
         fprintf(out,
-                "%d,%d,%.2f,%d,%.2f,%llu\n",
+                "%d,%d,%.2f,%d,%.2f,%llu,%llu\n",
                 frontier,
                 prefill_tokens,
                 prefill_sec > 0.0 ? (double)prefill_tokens / prefill_sec : 0.0,
                 cfg.gen_tokens,
                 gen_sec > 0.0 ? (double)cfg.gen_tokens / gen_sec : 0.0,
-                (unsigned long long)snap.len);
+                (unsigned long long)snap.len,
+                (unsigned long long)runtime_memory.total_bytes);
         fflush(out);
 
         previous = frontier;

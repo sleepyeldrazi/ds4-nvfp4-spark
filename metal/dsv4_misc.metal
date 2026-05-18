@@ -62,6 +62,7 @@ struct ds4_metal_args_dsv4_indexed_attention {
     uint64_t dst_token_stride;
     uint64_t dst_head_stride;
     float    scale;
+    uint32_t comp_turbo4;
 };
 
 struct ds4_metal_args_dsv4_indexer_scores_fused {
@@ -79,12 +80,497 @@ struct ds4_metal_args_dsv4_indexer_scores_fused {
     float    scale;
 };
 
+constant float dsv4_indexed_turbo4_centroids[16] = {
+    -0.173926f, -0.117195f, -0.089527f, -0.068756f,
+    -0.051262f, -0.035597f, -0.020989f, -0.006938f,
+     0.006938f,  0.020989f,  0.035597f,  0.051262f,
+     0.068756f,  0.089527f,  0.117195f,  0.173926f
+};
+
+constant float dsv4_indexed_turbo3_centroids[8] = {
+    -0.190685f, -0.117832f, -0.065717f, -0.021460f,
+     0.021460f,  0.065717f,  0.117832f,  0.190685f
+};
+
+constant half dsv4_indexed_turbo3_centroids_h[8] = {
+    -0.190685h, -0.117832h, -0.065717h, -0.021460h,
+     0.021460h,  0.065717h,  0.117832h,  0.190685h
+};
+
+constant float dsv4_indexed_turbo_rht_s1[128] = {
+    -1.0f,  1.0f,  1.0f, -1.0f, -1.0f,  1.0f, -1.0f,  1.0f,
+    -1.0f, -1.0f,  1.0f,  1.0f,  1.0f,  1.0f,  1.0f,  1.0f,
+     1.0f, -1.0f,  1.0f, -1.0f,  1.0f, -1.0f, -1.0f,  1.0f,
+     1.0f,  1.0f, -1.0f,  1.0f,  1.0f, -1.0f, -1.0f, -1.0f,
+    -1.0f,  1.0f,  1.0f, -1.0f,  1.0f,  1.0f, -1.0f,  1.0f,
+    -1.0f,  1.0f,  1.0f, -1.0f, -1.0f,  1.0f, -1.0f,  1.0f,
+     1.0f,  1.0f,  1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f,
+     1.0f, -1.0f,  1.0f,  1.0f,  1.0f,  1.0f, -1.0f,  1.0f,
+    -1.0f, -1.0f,  1.0f, -1.0f, -1.0f, -1.0f,  1.0f, -1.0f,
+    -1.0f, -1.0f,  1.0f, -1.0f, -1.0f, -1.0f,  1.0f,  1.0f,
+     1.0f, -1.0f, -1.0f,  1.0f,  1.0f,  1.0f, -1.0f, -1.0f,
+     1.0f,  1.0f, -1.0f,  1.0f,  1.0f, -1.0f,  1.0f, -1.0f,
+    -1.0f,  1.0f,  1.0f, -1.0f,  1.0f, -1.0f,  1.0f, -1.0f,
+     1.0f,  1.0f,  1.0f,  1.0f, -1.0f,  1.0f, -1.0f,  1.0f,
+     1.0f, -1.0f,  1.0f,  1.0f, -1.0f, -1.0f, -1.0f, -1.0f,
+    -1.0f,  1.0f,  1.0f, -1.0f,  1.0f,  1.0f, -1.0f,  1.0f
+};
+
+constant float dsv4_indexed_turbo_rht_s2[128] = {
+     1.0f,  1.0f,  1.0f,  1.0f, -1.0f,  1.0f,  1.0f, -1.0f,
+     1.0f, -1.0f, -1.0f, -1.0f,  1.0f, -1.0f, -1.0f, -1.0f,
+     1.0f,  1.0f, -1.0f, -1.0f,  1.0f, -1.0f,  1.0f, -1.0f,
+     1.0f, -1.0f, -1.0f,  1.0f, -1.0f,  1.0f,  1.0f,  1.0f,
+     1.0f,  1.0f, -1.0f, -1.0f, -1.0f,  1.0f, -1.0f, -1.0f,
+    -1.0f, -1.0f, -1.0f, -1.0f,  1.0f,  1.0f,  1.0f, -1.0f,
+     1.0f, -1.0f,  1.0f,  1.0f,  1.0f, -1.0f, -1.0f,  1.0f,
+    -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f,  1.0f,  1.0f,
+     1.0f, -1.0f,  1.0f, -1.0f, -1.0f, -1.0f, -1.0f,  1.0f,
+    -1.0f,  1.0f, -1.0f,  1.0f, -1.0f, -1.0f,  1.0f,  1.0f,
+    -1.0f,  1.0f, -1.0f,  1.0f,  1.0f, -1.0f,  1.0f, -1.0f,
+    -1.0f, -1.0f, -1.0f,  1.0f, -1.0f, -1.0f,  1.0f, -1.0f,
+     1.0f, -1.0f,  1.0f,  1.0f,  1.0f, -1.0f, -1.0f,  1.0f,
+    -1.0f,  1.0f, -1.0f,  1.0f,  1.0f, -1.0f, -1.0f,  1.0f,
+    -1.0f,  1.0f, -1.0f,  1.0f,  1.0f, -1.0f,  1.0f, -1.0f,
+     1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f,  1.0f, -1.0f
+};
+
+static inline void dsv4_indexed_turbo4_load_row_to_shared(
+        device const uchar *row,
+        threadgroup float4 *kv_shared,
+        uint shared_row,
+        ushort tid) {
+    threadgroup float4 *dst4 = kv_shared + (ulong)shared_row * 128ul;
+
+    for (uint vec = (uint)tid; vec < 96u; vec += 256u) {
+        const uint block = vec >> 5;
+        const uint off4 = vec & 31u;
+        device const uchar *in_block = row + (ulong)block * 68ul;
+        const float corrected = *((device const float *)in_block);
+        device const uchar *qs = in_block + sizeof(float);
+        const uchar packed0 = qs[off4 * 2u + 0u];
+        const uchar packed1 = qs[off4 * 2u + 1u];
+        dst4[block * 32u + off4] = float4(
+            dsv4_indexed_turbo4_centroids[(uint)packed0 & 0x0fu],
+            dsv4_indexed_turbo4_centroids[((uint)packed0 >> 4) & 0x0fu],
+            dsv4_indexed_turbo4_centroids[(uint)packed1 & 0x0fu],
+            dsv4_indexed_turbo4_centroids[((uint)packed1 >> 4) & 0x0fu]) * corrected;
+    }
+
+    device const float *tail = (device const float *)(row + 3ul * 68ul);
+    if (tid < 128) {
+        threadgroup float *dst = (threadgroup float *)kv_shared + (ulong)shared_row * 512ul;
+        dst[384u + (uint)tid] = tail[(uint)tid];
+    }
+}
+
+static inline void dsv4_indexed_turbo3_load_row_to_shared(
+        device const uchar *row,
+        threadgroup float4 *kv_shared,
+        uint shared_row,
+        ushort tid) {
+    threadgroup float4 *dst4 = kv_shared + (ulong)shared_row * 128ul;
+
+    for (uint vec = (uint)tid; vec < 128u; vec += 256u) {
+        const uint block = vec >> 5;
+        const uint off4 = vec & 31u;
+        device const uchar *in_block = row + (ulong)block * 50ul;
+        const float corrected = float(*((device const half *)in_block));
+        device const uchar *qs = in_block + sizeof(half);
+        device const uchar *signs = qs + 32ul;
+        const uchar packed = qs[off4];
+        const uchar sb = signs[off4 >> 1u];
+        const uint sshift = (off4 & 1u) * 4u;
+        dst4[block * 32u + off4] = float4(
+            dsv4_indexed_turbo3_centroids[((uint)packed & 0x03u) |
+                ((((uint)sb >> (sshift + 0u)) & 0x01u) << 2u)],
+            dsv4_indexed_turbo3_centroids[(((uint)packed >> 2u) & 0x03u) |
+                ((((uint)sb >> (sshift + 1u)) & 0x01u) << 2u)],
+            dsv4_indexed_turbo3_centroids[(((uint)packed >> 4u) & 0x03u) |
+                ((((uint)sb >> (sshift + 2u)) & 0x01u) << 2u)],
+            dsv4_indexed_turbo3_centroids[(((uint)packed >> 6u) & 0x03u) |
+                ((((uint)sb >> (sshift + 3u)) & 0x01u) << 2u)]) * corrected;
+    }
+}
+
+static inline void dsv4_indexed_turbo3_load_row_to_shared_half(
+        device const uchar *row,
+        threadgroup float4 *kv_shared,
+        uint shared_row,
+        ushort tid) {
+    threadgroup half4 *dst4 = (threadgroup half4 *)kv_shared + (ulong)shared_row * 128ul;
+
+    for (uint vec = (uint)tid; vec < 128u; vec += 256u) {
+        const uint block = vec >> 5;
+        const uint off4 = vec & 31u;
+        device const uchar *in_block = row + (ulong)block * 50ul;
+        const half corrected = *((device const half *)in_block);
+        device const uchar *qs = in_block + sizeof(half);
+        device const uchar *signs = qs + 32ul;
+        const uchar packed = qs[off4];
+        const uchar sb = signs[off4 >> 1u];
+        const uint sshift = (off4 & 1u) * 4u;
+        dst4[block * 32u + off4] = half4(
+            dsv4_indexed_turbo3_centroids_h[((uint)packed & 0x03u) |
+                ((((uint)sb >> (sshift + 0u)) & 0x01u) << 2u)],
+            dsv4_indexed_turbo3_centroids_h[(((uint)packed >> 2u) & 0x03u) |
+                ((((uint)sb >> (sshift + 1u)) & 0x01u) << 2u)],
+            dsv4_indexed_turbo3_centroids_h[(((uint)packed >> 4u) & 0x03u) |
+                ((((uint)sb >> (sshift + 2u)) & 0x01u) << 2u)],
+            dsv4_indexed_turbo3_centroids_h[(((uint)packed >> 6u) & 0x03u) |
+                ((((uint)sb >> (sshift + 3u)) & 0x01u) << 2u)]) * corrected;
+    }
+}
+
+static inline void dsv4_indexed_turbo3_load_rows_to_shared_half(
+        device const char *comp_kv,
+        uint64_t comp_row_stride,
+        thread const uint rows[8],
+        uint n_rows,
+        threadgroup float4 *kv_shared,
+        ushort tid) {
+    threadgroup half4 *dst4 = (threadgroup half4 *)kv_shared;
+
+    for (uint off = (uint)tid; off < n_rows * 128u; off += 256u) {
+        const uint r = off >> 7;
+        const uint vec = off & 127u;
+        const uint block = vec >> 5;
+        const uint off4 = vec & 31u;
+        device const uchar *in_block = (device const uchar *)(comp_kv +
+            (uint64_t)rows[r] * comp_row_stride + (uint64_t)block * 50ul);
+        const half corrected = *((device const half *)in_block);
+        device const uchar *qs = in_block + sizeof(half);
+        device const uchar *signs = qs + 32ul;
+        const uchar packed = qs[off4];
+        const uchar sb = signs[off4 >> 1u];
+        const uint sshift = (off4 & 1u) * 4u;
+        dst4[off] = half4(
+            dsv4_indexed_turbo3_centroids_h[((uint)packed & 0x03u) |
+                ((((uint)sb >> (sshift + 0u)) & 0x01u) << 2u)],
+            dsv4_indexed_turbo3_centroids_h[(((uint)packed >> 2u) & 0x03u) |
+                ((((uint)sb >> (sshift + 1u)) & 0x01u) << 2u)],
+            dsv4_indexed_turbo3_centroids_h[(((uint)packed >> 4u) & 0x03u) |
+                ((((uint)sb >> (sshift + 2u)) & 0x01u) << 2u)],
+            dsv4_indexed_turbo3_centroids_h[(((uint)packed >> 6u) & 0x03u) |
+                ((((uint)sb >> (sshift + 3u)) & 0x01u) << 2u)]) * corrected;
+    }
+}
+
+static inline void dsv4_indexed_turbo3n_load_rows_to_shared_half(
+        device const char *comp_kv,
+        uint64_t comp_row_stride,
+        thread const uint rows[8],
+        uint n_rows,
+        threadgroup float4 *kv_shared,
+        ushort tid) {
+    threadgroup half4 *dst4 = (threadgroup half4 *)kv_shared;
+
+    for (uint off = (uint)tid; off < n_rows * 128u; off += 256u) {
+        const uint r = off >> 7;
+        const uint vec = off & 127u;
+        device const uchar *row = (device const uchar *)(comp_kv +
+            (uint64_t)rows[r] * comp_row_stride);
+
+        if (vec < 96u) {
+            const uint block = vec >> 5;
+            const uint off4 = vec & 31u;
+            device const uchar *in_block = row + (uint64_t)block * 50ul;
+            const half corrected = *((device const half *)in_block);
+            device const uchar *qs = in_block + sizeof(half);
+            device const uchar *signs = qs + 32ul;
+            const uchar packed = qs[off4];
+            const uchar sb = signs[off4 >> 1u];
+            const uint sshift = (off4 & 1u) * 4u;
+            dst4[off] = half4(
+                dsv4_indexed_turbo3_centroids_h[((uint)packed & 0x03u) |
+                    ((((uint)sb >> (sshift + 0u)) & 0x01u) << 2u)],
+                dsv4_indexed_turbo3_centroids_h[(((uint)packed >> 2u) & 0x03u) |
+                    ((((uint)sb >> (sshift + 1u)) & 0x01u) << 2u)],
+                dsv4_indexed_turbo3_centroids_h[(((uint)packed >> 4u) & 0x03u) |
+                    ((((uint)sb >> (sshift + 2u)) & 0x01u) << 2u)],
+                dsv4_indexed_turbo3_centroids_h[(((uint)packed >> 6u) & 0x03u) |
+                    ((((uint)sb >> (sshift + 3u)) & 0x01u) << 2u)]) * corrected;
+        } else {
+            device const float4 *tail = (device const float4 *)(row + 150ul);
+            dst4[off] = (half4)tail[vec - 96u];
+        }
+    }
+}
+
+static inline void dsv4_indexed_turbo4_fwht_128_shared(
+        threadgroup float *scratch,
+        ulong base,
+        ushort lane) {
+    for (uint len = 1u; len < 128u; len <<= 1u) {
+        for (uint op = (uint)lane; op < 64u; op += 32u) {
+            const uint group = op / len;
+            const uint elem = op - group * len;
+            const ulong i = base + (ulong)(group * (len << 1u) + elem);
+            const float a = scratch[i];
+            const float b = scratch[i + len];
+            scratch[i] = a + b;
+            scratch[i + len] = a - b;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const ulong elem = (ulong)lane * 4ul;
+    scratch[base + elem + 0ul] *= 0.08838834764831845f;
+    scratch[base + elem + 1ul] *= 0.08838834764831845f;
+    scratch[base + elem + 2ul] *= 0.08838834764831845f;
+    scratch[base + elem + 3ul] *= 0.08838834764831845f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+static inline void dsv4_indexed_turbo3_rht_128_shared(
+        threadgroup float *scratch,
+        ulong base,
+        ushort lane,
+        bool inverse) {
+    const ulong elem = (ulong)lane * 4ul;
+    for (uint i = 0u; i < 4u; i++) {
+        const uint idx = (uint)elem + i;
+        scratch[base + elem + (ulong)i] *= inverse
+            ? dsv4_indexed_turbo_rht_s2[idx]
+            : dsv4_indexed_turbo_rht_s1[idx];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    dsv4_indexed_turbo4_fwht_128_shared(scratch, base, lane);
+
+    for (uint i = 0u; i < 4u; i++) {
+        const uint idx = (uint)elem + i;
+        scratch[base + elem + (ulong)i] *= inverse
+            ? dsv4_indexed_turbo_rht_s1[idx]
+            : dsv4_indexed_turbo_rht_s2[idx];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+static inline void dsv4_indexed_turbo3_rht_512_shared(
+        threadgroup float *scratch,
+        ulong base,
+        ushort lane,
+        bool inverse) {
+    const ulong elem = (ulong)lane * 4ul;
+    for (uint group = 0u; group < 4u; group++) {
+        const ulong gbase = base + (ulong)group * 128ul;
+        for (uint i = 0u; i < 4u; i++) {
+            const uint idx = (uint)elem + i;
+            scratch[gbase + elem + (ulong)i] *= inverse
+                ? dsv4_indexed_turbo_rht_s2[idx]
+                : dsv4_indexed_turbo_rht_s1[idx];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint len = 1u; len < 128u; len <<= 1u) {
+        for (uint group = 0u; group < 4u; group++) {
+            const ulong gbase = base + (ulong)group * 128ul;
+            for (uint op = (uint)lane; op < 64u; op += 32u) {
+                const uint group_idx = op / len;
+                const uint elem_idx = op - group_idx * len;
+                const ulong i = gbase + (ulong)(group_idx * (len << 1u) + elem_idx);
+                const float a = scratch[i];
+                const float b = scratch[i + len];
+                scratch[i] = a + b;
+                scratch[i + len] = a - b;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint group = 0u; group < 4u; group++) {
+        const ulong gbase = base + (ulong)group * 128ul;
+        for (uint i = 0u; i < 4u; i++) {
+            const uint idx = (uint)elem + i;
+            scratch[gbase + elem + (ulong)i] *= 0.08838834764831845f *
+                (inverse ? dsv4_indexed_turbo_rht_s1[idx] : dsv4_indexed_turbo_rht_s2[idx]);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+static inline void dsv4_indexed_turbo4_store4(
+        threadgroup float *scratch,
+        ulong base,
+        ushort lane,
+        float4 v) {
+    const ulong elem = base + (ulong)lane * 4ul;
+    scratch[elem + 0ul] = v.x;
+    scratch[elem + 1ul] = v.y;
+    scratch[elem + 2ul] = v.z;
+    scratch[elem + 3ul] = v.w;
+}
+
+static inline float4 dsv4_indexed_turbo4_load4(
+        threadgroup const float *scratch,
+        ulong base,
+        ushort lane) {
+    const ulong elem = base + (ulong)lane * 4ul;
+    return float4(scratch[elem + 0ul],
+                  scratch[elem + 1ul],
+                  scratch[elem + 2ul],
+                  scratch[elem + 3ul]);
+}
+
+static inline void dsv4_indexed_turbo4_rotate_q(
+        threadgroup float *scratch,
+        ushort sg,
+        ushort lane,
+        half4 q0,
+        half4 q1,
+        half4 q2,
+        thread float4 &qr0,
+        thread float4 &qr1,
+        thread float4 &qr2) {
+    const ulong base = (ulong)sg * 512ul;
+    dsv4_indexed_turbo4_store4(scratch, base +   0ul, lane, (float4)q0);
+    dsv4_indexed_turbo4_store4(scratch, base + 128ul, lane, (float4)q1);
+    dsv4_indexed_turbo4_store4(scratch, base + 256ul, lane, (float4)q2);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    dsv4_indexed_turbo4_fwht_128_shared(scratch, base +   0ul, lane);
+    dsv4_indexed_turbo4_fwht_128_shared(scratch, base + 128ul, lane);
+    dsv4_indexed_turbo4_fwht_128_shared(scratch, base + 256ul, lane);
+
+    qr0 = dsv4_indexed_turbo4_load4(scratch, base +   0ul, lane);
+    qr1 = dsv4_indexed_turbo4_load4(scratch, base + 128ul, lane);
+    qr2 = dsv4_indexed_turbo4_load4(scratch, base + 256ul, lane);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+static inline void dsv4_indexed_turbo3_rotate_q(
+        threadgroup float *scratch,
+        ushort sg,
+        ushort lane,
+        half4 q0,
+        half4 q1,
+        half4 q2,
+        half4 q3,
+        thread float4 &qr0,
+        thread float4 &qr1,
+        thread float4 &qr2,
+        thread float4 &qr3) {
+    const ulong base = (ulong)sg * 512ul;
+    dsv4_indexed_turbo4_store4(scratch, base +   0ul, lane, (float4)q0);
+    dsv4_indexed_turbo4_store4(scratch, base + 128ul, lane, (float4)q1);
+    dsv4_indexed_turbo4_store4(scratch, base + 256ul, lane, (float4)q2);
+    dsv4_indexed_turbo4_store4(scratch, base + 384ul, lane, (float4)q3);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    dsv4_indexed_turbo3_rht_512_shared(scratch, base, lane, false);
+
+    qr0 = dsv4_indexed_turbo4_load4(scratch, base +   0ul, lane);
+    qr1 = dsv4_indexed_turbo4_load4(scratch, base + 128ul, lane);
+    qr2 = dsv4_indexed_turbo4_load4(scratch, base + 256ul, lane);
+    qr3 = dsv4_indexed_turbo4_load4(scratch, base + 384ul, lane);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+static inline void dsv4_indexed_turbo3n_rotate_q(
+        threadgroup float *scratch,
+        ushort sg,
+        ushort lane,
+        half4 q0,
+        half4 q1,
+        half4 q2,
+        thread float4 &qr0,
+        thread float4 &qr1,
+        thread float4 &qr2) {
+    const ulong base = (ulong)sg * 512ul;
+    dsv4_indexed_turbo4_store4(scratch, base +   0ul, lane, (float4)q0);
+    dsv4_indexed_turbo4_store4(scratch, base + 128ul, lane, (float4)q1);
+    dsv4_indexed_turbo4_store4(scratch, base + 256ul, lane, (float4)q2);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    dsv4_indexed_turbo3_rht_128_shared(scratch, base +   0ul, lane, false);
+    dsv4_indexed_turbo3_rht_128_shared(scratch, base + 128ul, lane, false);
+    dsv4_indexed_turbo3_rht_128_shared(scratch, base + 256ul, lane, false);
+
+    qr0 = dsv4_indexed_turbo4_load4(scratch, base +   0ul, lane);
+    qr1 = dsv4_indexed_turbo4_load4(scratch, base + 128ul, lane);
+    qr2 = dsv4_indexed_turbo4_load4(scratch, base + 256ul, lane);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+static inline void dsv4_indexed_turbo4_inverse_output(
+        threadgroup float *scratch,
+        ushort sg,
+        ushort lane,
+        thread float4 &o0,
+        thread float4 &o1,
+        thread float4 &o2) {
+    const ulong base = (ulong)sg * 512ul;
+    dsv4_indexed_turbo4_store4(scratch, base +   0ul, lane, o0);
+    dsv4_indexed_turbo4_store4(scratch, base + 128ul, lane, o1);
+    dsv4_indexed_turbo4_store4(scratch, base + 256ul, lane, o2);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    dsv4_indexed_turbo4_fwht_128_shared(scratch, base +   0ul, lane);
+    dsv4_indexed_turbo4_fwht_128_shared(scratch, base + 128ul, lane);
+    dsv4_indexed_turbo4_fwht_128_shared(scratch, base + 256ul, lane);
+
+    o0 = dsv4_indexed_turbo4_load4(scratch, base +   0ul, lane);
+    o1 = dsv4_indexed_turbo4_load4(scratch, base + 128ul, lane);
+    o2 = dsv4_indexed_turbo4_load4(scratch, base + 256ul, lane);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+static inline void dsv4_indexed_turbo3n_inverse_output(
+        threadgroup float *scratch,
+        ushort sg,
+        ushort lane,
+        thread float4 &o0,
+        thread float4 &o1,
+        thread float4 &o2) {
+    const ulong base = (ulong)sg * 512ul;
+    dsv4_indexed_turbo4_store4(scratch, base +   0ul, lane, o0);
+    dsv4_indexed_turbo4_store4(scratch, base + 128ul, lane, o1);
+    dsv4_indexed_turbo4_store4(scratch, base + 256ul, lane, o2);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    dsv4_indexed_turbo3_rht_128_shared(scratch, base +   0ul, lane, true);
+    dsv4_indexed_turbo3_rht_128_shared(scratch, base + 128ul, lane, true);
+    dsv4_indexed_turbo3_rht_128_shared(scratch, base + 256ul, lane, true);
+
+    o0 = dsv4_indexed_turbo4_load4(scratch, base +   0ul, lane);
+    o1 = dsv4_indexed_turbo4_load4(scratch, base + 128ul, lane);
+    o2 = dsv4_indexed_turbo4_load4(scratch, base + 256ul, lane);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+static inline void dsv4_indexed_turbo3_inverse_output(
+        threadgroup float *scratch,
+        ushort sg,
+        ushort lane,
+        thread float4 &o0,
+        thread float4 &o1,
+        thread float4 &o2,
+        thread float4 &o3) {
+    const ulong base = (ulong)sg * 512ul;
+    dsv4_indexed_turbo4_store4(scratch, base +   0ul, lane, o0);
+    dsv4_indexed_turbo4_store4(scratch, base + 128ul, lane, o1);
+    dsv4_indexed_turbo4_store4(scratch, base + 256ul, lane, o2);
+    dsv4_indexed_turbo4_store4(scratch, base + 384ul, lane, o3);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    dsv4_indexed_turbo3_rht_512_shared(scratch, base, lane, true);
+
+    o0 = dsv4_indexed_turbo4_load4(scratch, base +   0ul, lane);
+    o1 = dsv4_indexed_turbo4_load4(scratch, base + 128ul, lane);
+    o2 = dsv4_indexed_turbo4_load4(scratch, base + 256ul, lane);
+    o3 = dsv4_indexed_turbo4_load4(scratch, base + 384ul, lane);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
 struct ds4_metal_args_dsv4_router_select_one {
     uint32_t has_bias;
     uint32_t hash_mode;
     uint32_t use_token_buffer;
     uint32_t token;
     uint32_t hash_rows;
+    uint32_t n_expert;
 };
 
 struct ds4_metal_args_dsv4_directional_steering_project {
@@ -230,10 +716,10 @@ kernel void kernel_dsv4_router_finalize_one(
         device int32_t *selected,
         threadgroup float *scratch [[threadgroup(0)]],
         uint tid [[thread_position_in_threadgroup]]) {
-    if (tid >= 256) return;
+    if (tid >= args.n_expert) return;
 
     threadgroup float *sel_scores = scratch;
-    threadgroup int32_t *idx = (threadgroup int32_t *)(scratch + 256);
+    threadgroup int32_t *idx = (threadgroup int32_t *)(scratch + args.n_expert);
     const float p = probs[tid];
     sel_scores[tid] = args.has_bias ? p + bias[tid] : p;
     idx[tid] = (int32_t)tid;
@@ -249,7 +735,7 @@ kernel void kernel_dsv4_router_finalize_one(
             }
         }
     } else {
-        for (uint k = 2; k <= 256; k <<= 1) {
+        for (uint k = 2; k <= args.n_expert; k <<= 1) {
             for (uint j = k >> 1; j > 0; j >>= 1) {
                 const uint other = tid ^ j;
                 if (other > tid) {
@@ -467,6 +953,218 @@ static inline void dsv4_attend_shared_f32_row_as_f16_at(
                                       o0, o1, o2, o3);
 }
 
+static inline void dsv4_attend_turbo4_shared_rotated_row_at(
+        threadgroup const float4 *kv4,
+        uint row_in_tg,
+        float4 qr0,
+        float4 qr1,
+        float4 qr2,
+        half4 q3,
+        float scale,
+        ushort lane,
+        thread float &M,
+        thread float &S,
+        thread float4 &raw0,
+        thread float4 &raw1,
+        thread float4 &raw2,
+        thread float4 &raw3,
+        thread float4 &rot0,
+        thread float4 &rot1,
+        thread float4 &rot2,
+        thread float4 &tail3) {
+    threadgroup const float4 *row = kv4 + row_in_tg * 128u;
+    const half4 k0 = (half4)row[lane +  0];
+    const half4 k1 = (half4)row[lane + 32];
+    const half4 k2 = (half4)row[lane + 64];
+    const half4 k3 = (half4)row[lane + 96];
+
+    float score = dot(qr0, (float4)k0) +
+                  dot(qr1, (float4)k1) +
+                  dot(qr2, (float4)k2) +
+                  dot((float4)q3, (float4)k3);
+    score = simd_sum(score) * scale;
+
+    const float old_m = M;
+    const float new_m = max(M, score);
+    const float old_scale = exp(old_m - new_m);
+    const float row_scale = exp(score - new_m);
+
+    S = S * old_scale + row_scale;
+    raw0 *= old_scale;
+    raw1 *= old_scale;
+    raw2 *= old_scale;
+    raw3 *= old_scale;
+    rot0 *= old_scale;
+    rot1 *= old_scale;
+    rot2 *= old_scale;
+    tail3 *= old_scale;
+
+    rot0 += (float4)k0 * row_scale;
+    rot1 += (float4)k1 * row_scale;
+    rot2 += (float4)k2 * row_scale;
+    tail3 += (float4)k3 * row_scale;
+    M = new_m;
+}
+
+static inline void dsv4_attend_turbo3n_shared_rotated_half_row_at(
+        threadgroup const float4 *kv4,
+        uint row_in_tg,
+        float4 qr0,
+        float4 qr1,
+        float4 qr2,
+        half4 q3,
+        float scale,
+        ushort lane,
+        thread float &M,
+        thread float &S,
+        thread float4 &raw0,
+        thread float4 &raw1,
+        thread float4 &raw2,
+        thread float4 &raw3,
+        thread float4 &rot0,
+        thread float4 &rot1,
+        thread float4 &rot2,
+        thread float4 &tail3) {
+    threadgroup const half4 *row = (threadgroup const half4 *)kv4 + row_in_tg * 128u;
+    const half4 k0 = row[lane +  0];
+    const half4 k1 = row[lane + 32];
+    const half4 k2 = row[lane + 64];
+    const half4 k3 = row[lane + 96];
+
+    float score = dot(qr0, (float4)k0) +
+                  dot(qr1, (float4)k1) +
+                  dot(qr2, (float4)k2) +
+                  dot((float4)q3, (float4)k3);
+    score = simd_sum(score) * scale;
+
+    const float old_m = M;
+    const float new_m = max(M, score);
+    const float old_scale = exp(old_m - new_m);
+    const float row_scale = exp(score - new_m);
+
+    S = S * old_scale + row_scale;
+    raw0 *= old_scale;
+    raw1 *= old_scale;
+    raw2 *= old_scale;
+    raw3 *= old_scale;
+    rot0 *= old_scale;
+    rot1 *= old_scale;
+    rot2 *= old_scale;
+    tail3 *= old_scale;
+
+    rot0 += (float4)k0 * row_scale;
+    rot1 += (float4)k1 * row_scale;
+    rot2 += (float4)k2 * row_scale;
+    tail3 += (float4)k3 * row_scale;
+    M = new_m;
+}
+
+static inline void dsv4_attend_turbo3_shared_rotated_row_at(
+        threadgroup const float4 *kv4,
+        uint row_in_tg,
+        float4 qr0,
+        float4 qr1,
+        float4 qr2,
+        float4 qr3,
+        float scale,
+        ushort lane,
+        thread float &M,
+        thread float &S,
+        thread float4 &raw0,
+        thread float4 &raw1,
+        thread float4 &raw2,
+        thread float4 &raw3,
+        thread float4 &rot0,
+        thread float4 &rot1,
+        thread float4 &rot2,
+        thread float4 &rot3) {
+    threadgroup const float4 *row = kv4 + row_in_tg * 128u;
+    const half4 k0 = (half4)row[lane +  0];
+    const half4 k1 = (half4)row[lane + 32];
+    const half4 k2 = (half4)row[lane + 64];
+    const half4 k3 = (half4)row[lane + 96];
+
+    float score = dot(qr0, (float4)k0) +
+                  dot(qr1, (float4)k1) +
+                  dot(qr2, (float4)k2) +
+                  dot(qr3, (float4)k3);
+    score = simd_sum(score) * scale;
+
+    const float old_m = M;
+    const float new_m = max(M, score);
+    const float old_scale = exp(old_m - new_m);
+    const float row_scale = exp(score - new_m);
+
+    S = S * old_scale + row_scale;
+    raw0 *= old_scale;
+    raw1 *= old_scale;
+    raw2 *= old_scale;
+    raw3 *= old_scale;
+    rot0 *= old_scale;
+    rot1 *= old_scale;
+    rot2 *= old_scale;
+    rot3 *= old_scale;
+
+    rot0 += (float4)k0 * row_scale;
+    rot1 += (float4)k1 * row_scale;
+    rot2 += (float4)k2 * row_scale;
+    rot3 += (float4)k3 * row_scale;
+    M = new_m;
+}
+
+static inline void dsv4_attend_turbo3_shared_rotated_half_row_at(
+        threadgroup const float4 *kv4,
+        uint row_in_tg,
+        float4 qr0,
+        float4 qr1,
+        float4 qr2,
+        float4 qr3,
+        float scale,
+        ushort lane,
+        thread float &M,
+        thread float &S,
+        thread float4 &raw0,
+        thread float4 &raw1,
+        thread float4 &raw2,
+        thread float4 &raw3,
+        thread float4 &rot0,
+        thread float4 &rot1,
+        thread float4 &rot2,
+        thread float4 &rot3) {
+    threadgroup const half4 *row = (threadgroup const half4 *)kv4 + row_in_tg * 128u;
+    const half4 k0 = row[lane +  0];
+    const half4 k1 = row[lane + 32];
+    const half4 k2 = row[lane + 64];
+    const half4 k3 = row[lane + 96];
+
+    float score = dot(qr0, (float4)k0) +
+                  dot(qr1, (float4)k1) +
+                  dot(qr2, (float4)k2) +
+                  dot(qr3, (float4)k3);
+    score = simd_sum(score) * scale;
+
+    const float old_m = M;
+    const float new_m = max(M, score);
+    const float old_scale = exp(old_m - new_m);
+    const float row_scale = exp(score - new_m);
+
+    S = S * old_scale + row_scale;
+    raw0 *= old_scale;
+    raw1 *= old_scale;
+    raw2 *= old_scale;
+    raw3 *= old_scale;
+    rot0 *= old_scale;
+    rot1 *= old_scale;
+    rot2 *= old_scale;
+    rot3 *= old_scale;
+
+    rot0 += (float4)k0 * row_scale;
+    rot1 += (float4)k1 * row_scale;
+    rot2 += (float4)k2 * row_scale;
+    rot3 += (float4)k3 * row_scale;
+    M = new_m;
+}
+
 static inline void dsv4_attend_sink(
         float score,
         thread float &M,
@@ -485,6 +1183,35 @@ static inline void dsv4_attend_sink(
     o1 *= old_scale;
     o2 *= old_scale;
     o3 *= old_scale;
+    M = new_m;
+}
+
+static inline void dsv4_attend_sink_turbo4_split(
+        float score,
+        thread float &M,
+        thread float &S,
+        thread float4 &raw0,
+        thread float4 &raw1,
+        thread float4 &raw2,
+        thread float4 &raw3,
+        thread float4 &rot0,
+        thread float4 &rot1,
+        thread float4 &rot2,
+        thread float4 &tail3) {
+    const float old_m = M;
+    const float new_m = max(M, score);
+    const float old_scale = exp(old_m - new_m);
+    const float row_scale = exp(score - new_m);
+
+    S = S * old_scale + row_scale;
+    raw0 *= old_scale;
+    raw1 *= old_scale;
+    raw2 *= old_scale;
+    raw3 *= old_scale;
+    rot0 *= old_scale;
+    rot1 *= old_scale;
+    rot2 *= old_scale;
+    tail3 *= old_scale;
     M = new_m;
 }
 
@@ -594,9 +1321,9 @@ kernel void kernel_dsv4_indexed_mixed_attention_heads8(
 // Decode specialization of kernel_dsv4_indexed_mixed_attention_heads8.
 // Generation attends one token at a time, so the ratio-4 indexed path spends a
 // visible amount of time repeatedly staging the same K/V row for the eight
-// heads in a group. This variant stages four selected rows at once and then
-// consumes them sequentially, preserving the row order and online softmax math
-// while cutting threadgroup barriers in the long top-k scan.
+// heads in a group. This variant stages selected-row batches and then consumes
+// them sequentially, preserving row order and online softmax math while cutting
+// threadgroup barriers in the long top-k scan.
 kernel void kernel_dsv4_indexed_mixed_attention_heads8_rb4(
         constant ds4_metal_args_dsv4_indexed_attention & args,
         device const char *q,
@@ -623,6 +1350,46 @@ kernel void kernel_dsv4_indexed_mixed_attention_heads8_rb4(
     const half4 q1 = (half4)q4[lane + 32];
     const half4 q2 = (half4)q4[lane + 64];
     const half4 q3 = (half4)q4[lane + 96];
+    const bool comp_turbo3 = args.comp_turbo4 == 3u;
+    const bool comp_turbo4 = args.comp_turbo4 == 4u;
+    const bool comp_turbo3n = args.comp_turbo4 == 5u;
+    float4 qr0 = 0.0f;
+    float4 qr1 = 0.0f;
+    float4 qr2 = 0.0f;
+    float4 qr3 = 0.0f;
+    if (comp_turbo3) {
+        dsv4_indexed_turbo3_rotate_q((threadgroup float *)kv_shared,
+                                     sg,
+                                     lane,
+                                     q0,
+                                     q1,
+                                     q2,
+                                     q3,
+                                     qr0,
+                                     qr1,
+                                     qr2,
+                                     qr3);
+    } else if (comp_turbo3n) {
+        dsv4_indexed_turbo3n_rotate_q((threadgroup float *)kv_shared,
+                                      sg,
+                                      lane,
+                                      q0,
+                                      q1,
+                                      q2,
+                                      qr0,
+                                      qr1,
+                                      qr2);
+    } else if (comp_turbo4) {
+        dsv4_indexed_turbo4_rotate_q((threadgroup float *)kv_shared,
+                                     sg,
+                                     lane,
+                                     q0,
+                                     q1,
+                                     q2,
+                                     qr0,
+                                     qr1,
+                                     qr2);
+    }
 
     float M = -FLT_MAX/2.0f;
     float S = 0.0f;
@@ -630,6 +1397,10 @@ kernel void kernel_dsv4_indexed_mixed_attention_heads8_rb4(
     float4 o1 = 0.0f;
     float4 o2 = 0.0f;
     float4 o3 = 0.0f;
+    float4 ro0 = 0.0f;
+    float4 ro1 = 0.0f;
+    float4 ro2 = 0.0f;
+    float4 ro3 = 0.0f;
 
     const uint qpos = args.pos0 + token;
     const uint last_pos = args.pos0 + args.n_tokens - 1u;
@@ -670,11 +1441,12 @@ kernel void kernel_dsv4_indexed_mixed_attention_heads8_rb4(
     visible = min(visible, args.n_comp);
     device const int32_t *row_topk = (device const int32_t *)(topk +
         (uint64_t)token * args.topk_token_stride);
+    const uint comp_group = (comp_turbo3 || comp_turbo3n || comp_turbo4) ? 8u : 4u;
     bool stop = false;
-    for (uint i = 0; i < args.top_k && !stop; i += 4u) {
-        uint rows[4];
+    for (uint i = 0; i < args.top_k && !stop; i += comp_group) {
+        uint rows[8];
         uint n_rows = 0;
-        for (uint j = 0; j < 4u && i + j < args.top_k; j++) {
+        for (uint j = 0; j < comp_group && i + j < args.top_k; j++) {
             const int32_t idx = row_topk[i + j];
             if (idx < 0) {
                 continue;
@@ -688,27 +1460,132 @@ kernel void kernel_dsv4_indexed_mixed_attention_heads8_rb4(
         if (n_rows == 0) {
             continue;
         }
-        for (uint off = (uint)tid; off < n_rows * 128u; off += 256u) {
-            const uint r = off >> 7;
-            const uint c = off & 127u;
-            device const float4 *src = (device const float4 *)(comp_kv +
-                (uint64_t)rows[r] * args.comp_row_stride);
-            kv_shared[off] = src[c];
+        if (comp_turbo3) {
+            dsv4_indexed_turbo3_load_rows_to_shared_half(comp_kv,
+                                                         args.comp_row_stride,
+                                                         rows,
+                                                         n_rows,
+                                                         kv_shared,
+                                                         tid);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        } else if (comp_turbo3n) {
+            dsv4_indexed_turbo3n_load_rows_to_shared_half(comp_kv,
+                                                          args.comp_row_stride,
+                                                          rows,
+                                                          n_rows,
+                                                          kv_shared,
+                                                          tid);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        } else if (comp_turbo4) {
+            for (uint r = 0; r < n_rows; r++) {
+                device const uchar *src = (device const uchar *)(comp_kv +
+                    (uint64_t)rows[r] * args.comp_row_stride);
+                dsv4_indexed_turbo4_load_row_to_shared(src, kv_shared, r, tid);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        } else {
+            for (uint off = (uint)tid; off < n_rows * 128u; off += 256u) {
+                const uint r = off >> 7;
+                const uint c = off & 127u;
+                device const float4 *src = (device const float4 *)(comp_kv +
+                    (uint64_t)rows[r] * args.comp_row_stride);
+                kv_shared[off] = src[c];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint r = 0; r < n_rows; r++) {
-            dsv4_attend_shared_f32_row_as_f16_at(kv_shared,
-                                                 r,
-                                                 q0, q1, q2, q3,
-                                                 args.scale,
-                                                 lane,
-                                                 M, S,
-                                                 o0, o1, o2, o3);
+            if (comp_turbo3) {
+                dsv4_attend_turbo3_shared_rotated_half_row_at(kv_shared,
+                                                              r,
+                                                              qr0, qr1, qr2, qr3,
+                                                              args.scale,
+                                                              lane,
+                                                              M, S,
+                                                              o0, o1, o2, o3,
+                                                              ro0, ro1, ro2, ro3);
+            } else if (comp_turbo3n) {
+                dsv4_attend_turbo3n_shared_rotated_half_row_at(kv_shared,
+                                                               r,
+                                                               qr0, qr1, qr2, q3,
+                                                               args.scale,
+                                                               lane,
+                                                               M, S,
+                                                               o0, o1, o2, o3,
+                                                               ro0, ro1, ro2, ro3);
+            } else if (comp_turbo4) {
+                dsv4_attend_turbo4_shared_rotated_row_at(kv_shared,
+                                                         r,
+                                                         qr0, qr1, qr2, q3,
+                                                         args.scale,
+                                                         lane,
+                                                         M, S,
+                                                         o0, o1, o2, o3,
+                                                         ro0, ro1, ro2, ro3);
+            } else {
+                dsv4_attend_shared_f32_row_as_f16_at(kv_shared,
+                                                     r,
+                                                     q0, q1, q2, q3,
+                                                     args.scale,
+                                                     lane,
+                                                     M, S,
+                                                     o0, o1, o2, o3);
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    dsv4_attend_sink(((device const float *)sinks)[head], M, S, o0, o1, o2, o3);
+    if (comp_turbo3) {
+        dsv4_attend_sink_turbo4_split(((device const float *)sinks)[head],
+                                      M,
+                                      S,
+                                      o0, o1, o2, o3,
+                                      ro0, ro1, ro2, ro3);
+        dsv4_indexed_turbo3_inverse_output((threadgroup float *)kv_shared,
+                                           sg,
+                                           lane,
+                                           ro0,
+                                           ro1,
+                                           ro2,
+                                           ro3);
+        o0 += ro0;
+        o1 += ro1;
+        o2 += ro2;
+        o3 += ro3;
+    } else if (comp_turbo3n) {
+        dsv4_attend_sink_turbo4_split(((device const float *)sinks)[head],
+                                      M,
+                                      S,
+                                      o0, o1, o2, o3,
+                                      ro0, ro1, ro2, ro3);
+        dsv4_indexed_turbo3n_inverse_output((threadgroup float *)kv_shared,
+                                            sg,
+                                            lane,
+                                            ro0,
+                                            ro1,
+                                            ro2);
+        o0 += ro0;
+        o1 += ro1;
+        o2 += ro2;
+        o3 += ro3;
+    } else if (comp_turbo4) {
+        dsv4_attend_sink_turbo4_split(((device const float *)sinks)[head],
+                                      M,
+                                      S,
+                                      o0, o1, o2, o3,
+                                      ro0, ro1, ro2, ro3);
+        dsv4_indexed_turbo4_inverse_output((threadgroup float *)kv_shared,
+                                           sg,
+                                           lane,
+                                           ro0,
+                                           ro1,
+                                           ro2);
+        o0 += ro0;
+        o1 += ro1;
+        o2 += ro2;
+        o3 += ro3;
+    } else {
+        dsv4_attend_sink(((device const float *)sinks)[head], M, S, o0, o1, o2, o3);
+    }
 
     const float inv_s = S == 0.0f ? 0.0f : 1.0f/S;
     device float4 *dst4 = (device float4 *)(dst +

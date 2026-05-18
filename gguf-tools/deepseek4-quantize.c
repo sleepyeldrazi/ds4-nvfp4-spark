@@ -43,7 +43,22 @@
 #define DS4_KV_QUANTIZE_IMATRIX_DATASET   "quantize.imatrix.dataset"
 #define DS4_KV_QUANTIZE_IMATRIX_N_ENTRIES "quantize.imatrix.entries_count"
 #define DS4_KV_QUANTIZE_IMATRIX_N_CHUNKS  "quantize.imatrix.chunks_count"
+#define DS4_KV_REAP_ENABLED               "reap.enabled"
+#define DS4_KV_REAP_LAYOUT                "reap.layout"
+#define DS4_KV_REAP_PLAN_PATH             "reap.plan.path"
+#define DS4_KV_REAP_LAYER_POLICY          "reap.layer.policy"
+#define DS4_KV_REAP_LAYER_EXPERT_COUNT    "reap.layer.expert_count"
+#define DS4_KV_REAP_LAYER_KEEP_COUNT      "reap.layer.keep_count"
+#define DS4_REAP_LAYOUT_COMPACT           "ds4-compact-v1"
 #define DS4_GGUF_DEFAULT_ALIGNMENT 32
+#define DS4_REAP_N_LAYER 43
+
+enum {
+    REAP_POLICY_NONE = 0,
+    REAP_POLICY_HASH_PRESERVED = 1,
+    REAP_POLICY_ROUTER_MASK_PRUNED = 2,
+    REAP_POLICY_MOE_DISABLED = 3,
+};
 
 typedef enum {
     GGUF_TYPE_UINT8   = 0,
@@ -315,6 +330,19 @@ static int64_t json_i64(const json_doc *d, int tok) {
     memcpy(tmp, d->js + d->v[tok].start, (size_t)n);
     tmp[n] = '\0';
     return strtoll(tmp, NULL, 10);
+}
+
+static bool json_primitive_eq(const json_doc *d, int tok, const char *s) {
+    const json_tok *t = &d->v[tok];
+    const int n = t->end - t->start;
+    return t->type == JT_PRIMITIVE && (int)strlen(s) == n && memcmp(d->js + t->start, s, (size_t)n) == 0;
+}
+
+static bool json_bool_default(const json_doc *d, int tok, bool default_value) {
+    if (tok < 0) return default_value;
+    if (json_primitive_eq(d, tok, "true")) return true;
+    if (json_primitive_eq(d, tok, "false")) return false;
+    return default_value;
 }
 
 /* =====
@@ -865,6 +893,189 @@ static void imatrix_free(imatrix_store *im) {
 }
 
 /* =====
+ * Optional REAP mask plan
+ */
+
+#define REAP_MAX_LAYERS 128
+#define REAP_MAX_EXPERTS 4096
+
+typedef struct {
+    bool present;
+    bool disabled;
+    bool hash_routed;
+    bool has_keep_set;
+    int expert_count;
+    int n_keep;
+    int keep_list[REAP_MAX_EXPERTS];
+    bool keep_set[REAP_MAX_EXPERTS];
+} reap_layer_plan;
+
+typedef struct {
+    bool enabled;
+    char *path;
+    reap_layer_plan layers[REAP_MAX_LAYERS];
+} reap_plan;
+
+static void reap_plan_free(reap_plan *rp) {
+    free(rp->path);
+    memset(rp, 0, sizeof(*rp));
+}
+
+static int json_layer_key_to_int(const json_doc *d, int tok) {
+    char tmp[32];
+    const int n = d->v[tok].end - d->v[tok].start;
+    if (n <= 0 || n >= (int)sizeof(tmp)) die("bad REAP layer key");
+    memcpy(tmp, d->js + d->v[tok].start, (size_t)n);
+    tmp[n] = '\0';
+    return atoi(tmp);
+}
+
+static void reap_fill_keep_array(const json_doc *d, int arr_tok, reap_layer_plan *lp) {
+    if (arr_tok < 0 || d->v[arr_tok].type != JT_ARRAY) return;
+    lp->has_keep_set = true;
+    for (int i = arr_tok + 1; i < d->len && d->v[i].parent == arr_tok; i = json_skip(d, i)) {
+        int expert = (int)json_i64(d, i);
+        if (expert < 0 || expert >= REAP_MAX_EXPERTS) die("REAP keep_experts id out of supported range");
+        if (!lp->keep_set[expert]) {
+            if (lp->n_keep >= REAP_MAX_EXPERTS) die("too many REAP keep_experts");
+            lp->keep_list[lp->n_keep++] = expert;
+        }
+        lp->keep_set[expert] = true;
+    }
+}
+
+static void reap_load_plan(reap_plan *rp, const char *path) {
+    memset(rp, 0, sizeof(*rp));
+    if (!path) return;
+    size_t len = 0;
+    char *text = read_file(path, &len);
+    json_doc d = json_parse_text(text, len);
+    if (d.len < 1 || d.v[0].type != JT_OBJECT) die("bad REAP plan JSON");
+    int layers = json_obj_get(&d, 0, "layers");
+    if (layers < 0 || d.v[layers].type != JT_OBJECT) die("REAP plan has no layers object");
+
+    for (int i = layers + 1; i < d.len && d.v[i].parent == layers;) {
+        int k = i;
+        int v = i + 1;
+        if (v >= d.len || d.v[v].parent != layers) die("bad REAP layer object");
+        int layer = json_layer_key_to_int(&d, k);
+        if (layer < 0 || layer >= REAP_MAX_LAYERS) die("REAP layer id out of supported range");
+        if (d.v[v].type != JT_OBJECT) die("bad REAP layer plan");
+
+        reap_layer_plan *lp = &rp->layers[layer];
+        memset(lp, 0, sizeof(*lp));
+        lp->present = true;
+
+        int expert_count_tok = json_obj_get(&d, v, "expert_count");
+        if (expert_count_tok >= 0) lp->expert_count = (int)json_i64(&d, expert_count_tok);
+        if (lp->expert_count < 0 || lp->expert_count > REAP_MAX_EXPERTS) die("REAP expert_count out of supported range");
+
+        int policy = json_obj_get(&d, v, "activation_policy");
+        lp->disabled = policy >= 0 && json_tok_eq(&d, policy, "moe_disabled");
+        lp->hash_routed = json_bool_default(&d, json_obj_get(&d, v, "is_hash_routed"), false);
+
+        reap_fill_keep_array(&d, json_obj_get(&d, v, "keep_experts"), lp);
+        if (!lp->disabled && !lp->has_keep_set && lp->expert_count > 0) {
+            lp->has_keep_set = true;
+            for (int e = 0; e < lp->expert_count; e++) {
+                lp->keep_set[e] = true;
+                lp->keep_list[lp->n_keep++] = e;
+            }
+        }
+        i = json_skip(&d, v);
+    }
+
+    rp->enabled = true;
+    rp->path = xstrdup(path);
+    fprintf(stderr, "loaded REAP plan %s\n", path);
+    json_free(&d);
+    free(text);
+}
+
+static const reap_layer_plan *reap_layer_for(const reap_plan *rp, int layer) {
+    if (!rp || !rp->enabled || layer < 0 || layer >= REAP_MAX_LAYERS) return NULL;
+    return rp->layers[layer].present ? &rp->layers[layer] : NULL;
+}
+
+static bool gguf_blk_layer_rest(const char *name, int *layer_out, const char **rest_out) {
+    int layer = -1;
+    int n = 0;
+    if (sscanf(name, "blk.%d.%n", &layer, &n) != 1 || n <= 0) return false;
+    if (layer_out) *layer_out = layer;
+    if (rest_out) *rest_out = name + n;
+    return true;
+}
+
+static bool reap_expert_slot_is_kept(const reap_plan *rp, int layer, int expert) {
+    const reap_layer_plan *lp = reap_layer_for(rp, layer);
+    if (!lp) return true;
+    if (lp->disabled) return false;
+    if (expert < 0 || expert >= lp->expert_count) return false;
+    if (!lp->has_keep_set) return true;
+    return lp->keep_set[expert];
+}
+
+static int reap_layer_physical_expert_count(const reap_plan *rp, int layer, int fallback) {
+    const reap_layer_plan *lp = reap_layer_for(rp, layer);
+    if (!lp) return fallback;
+    if (lp->disabled) return 0;
+    if (lp->has_keep_set) return lp->n_keep;
+    return lp->expert_count > 0 ? lp->expert_count : fallback;
+}
+
+static int reap_compact_old_expert_for_slot(const reap_plan *rp, int layer, int compact_slot) {
+    const reap_layer_plan *lp = reap_layer_for(rp, layer);
+    if (!lp || !lp->has_keep_set) return compact_slot;
+    if (compact_slot < 0 || compact_slot >= lp->n_keep) die("REAP compact expert slot out of range");
+    return lp->keep_list[compact_slot];
+}
+
+static bool reap_regular_ffn_is_disabled(const reap_plan *rp, const char *gguf_name) {
+    int layer = -1;
+    const char *rest = NULL;
+    if (!gguf_blk_layer_rest(gguf_name, &layer, &rest)) return false;
+    const reap_layer_plan *lp = reap_layer_for(rp, layer);
+    if (!lp || !lp->disabled) return false;
+    return strcmp(rest, "ffn_gate_inp.weight") == 0 ||
+           strcmp(rest, "exp_probs_b.bias") == 0 ||
+           strcmp(rest, "ffn_gate_shexp.weight") == 0 ||
+           strcmp(rest, "ffn_up_shexp.weight") == 0 ||
+           strcmp(rest, "ffn_down_shexp.weight") == 0;
+}
+
+static bool reap_router_weight_tensor(const char *gguf_name, int *layer_out) {
+    int layer = -1;
+    const char *rest = NULL;
+    if (!gguf_blk_layer_rest(gguf_name, &layer, &rest)) return false;
+    if (strcmp(rest, "ffn_gate_inp.weight") != 0) return false;
+    if (layer_out) *layer_out = layer;
+    return true;
+}
+
+static bool reap_router_bias_tensor(const char *gguf_name, int *layer_out) {
+    int layer = -1;
+    const char *rest = NULL;
+    if (!gguf_blk_layer_rest(gguf_name, &layer, &rest)) return false;
+    if (strcmp(rest, "exp_probs_b.bias") != 0) return false;
+    if (layer_out) *layer_out = layer;
+    return true;
+}
+
+static bool reap_disabled_shared_expert_tensor(const reap_plan *rp, const char *gguf_name, int *layer_out) {
+    int layer = -1;
+    const char *rest = NULL;
+    if (!gguf_blk_layer_rest(gguf_name, &layer, &rest)) return false;
+    const reap_layer_plan *lp = reap_layer_for(rp, layer);
+    if (!lp || !lp->disabled) return false;
+    const bool matched =
+        strcmp(rest, "ffn_gate_shexp.weight") == 0 ||
+        strcmp(rest, "ffn_up_shexp.weight") == 0 ||
+        strcmp(rest, "ffn_down_shexp.weight") == 0;
+    if (matched && layer_out) *layer_out = layer;
+    return matched;
+}
+
+/* =====
  * GGUF tensor mapping and quantization policy
  */
 
@@ -879,12 +1090,15 @@ typedef struct {
 static expert_tensor parse_expert_tensor(const char *name) {
     expert_tensor e = {0};
     int layer = -1;
-    char kind[16];
-    if (sscanf(name, "blk.%d.ffn_%15[^_]_exps.weight", &layer, kind) == 2) {
-        if (strcmp(kind, "gate") == 0 || strcmp(kind, "down") == 0 || strcmp(kind, "up") == 0) {
+    const char *rest = NULL;
+    if (gguf_blk_layer_rest(name, &layer, &rest)) {
+        if (strcmp(rest, "ffn_gate_exps.weight") == 0 ||
+            strcmp(rest, "ffn_down_exps.weight") == 0 ||
+            strcmp(rest, "ffn_up_exps.weight") == 0) {
             e.is_expert = true;
             e.layer = layer;
-            e.part = strcmp(kind, "gate") == 0 ? EXP_W1 : strcmp(kind, "down") == 0 ? EXP_W2 : EXP_W3;
+            e.part = strcmp(rest, "ffn_gate_exps.weight") == 0 ? EXP_W1 :
+                     strcmp(rest, "ffn_down_exps.weight") == 0 ? EXP_W2 : EXP_W3;
         }
     }
     return e;
@@ -1125,6 +1339,53 @@ static byte_buf f32_to_type(const float *src, int64_t n, ds4q_type type, int64_t
     return out;
 }
 
+static int64_t tensor_meta_nelements(const tensor_meta *tmpl) {
+    int nd = tensor_n_dims(tmpl);
+    int64_t n = 1;
+    for (int i = 0; i < nd; i++) n *= tmpl->ne[i];
+    return n;
+}
+
+static byte_buf generate_zero_tensor(const tensor_meta *tmpl, ds4q_type target) {
+    int64_t n = tensor_meta_nelements(tmpl);
+    if (n == 0) {
+        byte_buf b = { .size = 0, .data = NULL };
+        b.data = xcalloc(1, 1);
+        return b;
+    }
+    if (target == DS4Q_TYPE_I32) {
+        byte_buf b = { .size = (size_t)n * sizeof(int32_t), .data = NULL };
+        b.data = xcalloc(b.size ? b.size : 1, 1);
+        return b;
+    }
+    if (!is_quantizable_target(target)) die("unsupported zero tensor target type");
+    float *zeros = xcalloc((size_t)n, sizeof(float));
+    byte_buf b = f32_to_type(zeros, n, target, tmpl->ne[0], NULL);
+    free(zeros);
+    return b;
+}
+
+static float *db_read_tensor_f32(st_db *db, const char *hf_name, const st_info *info, int64_t *n_out) {
+    float *f32 = NULL;
+    if (strcmp(info->dtype, "F8_E4M3") == 0) {
+        if (!str_ends(hf_name, ".weight")) die("FP8 tensor without .weight suffix");
+        char *scale_name = xstrdup(hf_name);
+        strcpy(scale_name + strlen(scale_name) - strlen(".weight"), ".scale");
+        if (!db_has(db, scale_name)) die("missing FP8 scale tensor");
+        st_value w = db_read(db, hf_name);
+        st_value s = db_read(db, scale_name);
+        f32 = dequant_fp8_weight(&w, &s, n_out);
+        st_value_free(&w);
+        st_value_free(&s);
+        free(scale_name);
+    } else {
+        st_value w = db_read(db, hf_name);
+        f32 = tensor_to_f32(&w, n_out);
+        st_value_free(&w);
+    }
+    return f32;
+}
+
 static byte_buf i64_to_i32(const st_value *src) {
     if (strcmp(src->dtype, "I64") != 0) die("expected I64 source for I32 tensor");
     const int64_t n = value_nelements(src);
@@ -1159,9 +1420,85 @@ static void check_reversed_shape(const char *gguf_name, const st_info *info, con
     }
 }
 
+static byte_buf generate_reap_router_weight(st_db *db, const char *gguf_name, const tensor_meta *tmpl,
+                                            ds4q_type target, const imatrix_store *imatrix,
+                                            const reap_plan *rp, int layer, char *hf_name) {
+    tensor_entry *te = db_tensor(db, hf_name, NULL);
+    if (te->info.n_dims != 2) die("REAP router weight source must be 2D");
+    const int64_t source_experts = te->info.shape[0];
+    const int64_t ncols = te->info.shape[1];
+    const int64_t output_experts = tmpl->ne[1];
+    if (tmpl->ne[0] != ncols) die("REAP router weight hidden size mismatch");
+    if (output_experts == 0) return generate_zero_tensor(tmpl, target);
+    int64_t src_n = 0;
+    float *src = db_read_tensor_f32(db, hf_name, &te->info, &src_n);
+    if (src_n != source_experts * ncols) die("REAP router weight source size mismatch");
+    float *dst = xcalloc((size_t)output_experts * (size_t)ncols, sizeof(float));
+    for (int64_t e = 0; e < output_experts; e++) {
+        const int old_expert = reap_compact_old_expert_for_slot(rp, layer, (int)e);
+        if (old_expert >= 0 && old_expert < source_experts && reap_expert_slot_is_kept(rp, layer, old_expert)) {
+            memcpy(dst + (size_t)e * (size_t)ncols,
+                   src + (size_t)old_expert * (size_t)ncols,
+                   (size_t)ncols * sizeof(float));
+        }
+    }
+    const char *names[2] = { gguf_name, hf_name };
+    const float *imat = imatrix_find(imatrix, names, 2, tmpl->ne[0], -1, 0);
+    byte_buf b = f32_to_type(dst, output_experts * ncols, target, tmpl->ne[0], imat);
+    free(dst);
+    free(src);
+    return b;
+}
+
+static byte_buf generate_reap_router_bias(st_db *db, const char *gguf_name, const tensor_meta *tmpl,
+                                          ds4q_type target, const imatrix_store *imatrix,
+                                          const reap_plan *rp, int layer, char *hf_name) {
+    tensor_entry *te = db_tensor(db, hf_name, NULL);
+    if (te->info.n_dims != 1) die("REAP router bias source must be 1D");
+    const int64_t source_experts = te->info.shape[0];
+    const int64_t output_experts = tmpl->ne[0];
+    if (output_experts == 0) return generate_zero_tensor(tmpl, target);
+    int64_t src_n = 0;
+    float *src = db_read_tensor_f32(db, hf_name, &te->info, &src_n);
+    if (src_n != source_experts) die("REAP router bias source size mismatch");
+    float *dst = xmalloc((size_t)output_experts * sizeof(float));
+    for (int64_t e = 0; e < output_experts; e++) dst[e] = -1.0e30f;
+    for (int64_t e = 0; e < output_experts; e++) {
+        const int old_expert = reap_compact_old_expert_for_slot(rp, layer, (int)e);
+        if (old_expert >= 0 && old_expert < source_experts && reap_expert_slot_is_kept(rp, layer, old_expert)) {
+            dst[e] = src[old_expert];
+        }
+    }
+    const char *names[2] = { gguf_name, hf_name };
+    const float *imat = imatrix_find(imatrix, names, 2, tmpl->ne[0], -1, 0);
+    byte_buf b = f32_to_type(dst, output_experts, target, tmpl->ne[0], imat);
+    free(dst);
+    free(src);
+    return b;
+}
+
 static byte_buf generate_regular(st_db *db, const char *gguf_name, const tensor_meta *tmpl,
-                                 ds4q_type target, const imatrix_store *imatrix) {
+                                 ds4q_type target, const imatrix_store *imatrix,
+                                 const reap_plan *rp) {
+    if (reap_regular_ffn_is_disabled(rp, gguf_name)) {
+        return generate_zero_tensor(tmpl, target);
+    }
+
     char *hf_name = hf_name_for_regular(gguf_name);
+    int router_layer = -1;
+    if (rp && rp->enabled && reap_router_weight_tensor(gguf_name, &router_layer) &&
+        reap_layer_for(rp, router_layer)) {
+        byte_buf b = generate_reap_router_weight(db, gguf_name, tmpl, target, imatrix, rp, router_layer, hf_name);
+        free(hf_name);
+        return b;
+    }
+    if (rp && rp->enabled && reap_router_bias_tensor(gguf_name, &router_layer) &&
+        reap_layer_for(rp, router_layer)) {
+        byte_buf b = generate_reap_router_bias(db, gguf_name, tmpl, target, imatrix, rp, router_layer, hf_name);
+        free(hf_name);
+        return b;
+    }
+
     tensor_entry *te = db_tensor(db, hf_name, NULL);
     check_reversed_shape(gguf_name, &te->info, tmpl);
     if (target == DS4Q_TYPE_I32) {
@@ -1173,23 +1510,7 @@ static byte_buf generate_regular(st_db *db, const char *gguf_name, const tensor_
     }
     if (!is_quantizable_target(target)) die("unsupported regular target type");
     int64_t n = 0;
-    float *f32 = NULL;
-    if (strcmp(te->info.dtype, "F8_E4M3") == 0) {
-        if (!str_ends(hf_name, ".weight")) die("FP8 tensor without .weight suffix");
-        char *scale_name = xstrdup(hf_name);
-        strcpy(scale_name + strlen(scale_name) - strlen(".weight"), ".scale");
-        if (!db_has(db, scale_name)) die("missing FP8 scale tensor");
-        st_value w = db_read(db, hf_name);
-        st_value s = db_read(db, scale_name);
-        f32 = dequant_fp8_weight(&w, &s, &n);
-        st_value_free(&w);
-        st_value_free(&s);
-        free(scale_name);
-    } else {
-        st_value w = db_read(db, hf_name);
-        f32 = tensor_to_f32(&w, &n);
-        st_value_free(&w);
-    }
+    float *f32 = db_read_tensor_f32(db, hf_name, &te->info, &n);
     const char *names[2] = { gguf_name, hf_name };
     const float *imat = imatrix_find(imatrix, names, 2, tmpl->ne[0], -1, 0);
     byte_buf b = f32_to_type(f32, n, target, tmpl->ne[0], imat);
@@ -1205,20 +1526,38 @@ typedef struct {
     ds4q_type target;
     int n_experts;
     const imatrix_store *imatrix;
+    const reap_plan *reap;
     expert_tensor expert;
     const char *wid;
+    int original_expert_count;
     int64_t ncols;
     int64_t nrows;
     size_t per_expert;
     byte_buf *out;
+    const byte_buf *zero_expert;
     int next;
     int done;
     pthread_mutex_t lock;
 } expert_job;
 
+static byte_buf generate_zero_expert(const expert_job *j) {
+    const int64_t n = j->nrows * j->ncols;
+    float *zeros = xcalloc((size_t)n, sizeof(float));
+    byte_buf q = f32_to_type(zeros, n, j->target, j->ncols, NULL);
+    free(zeros);
+    return q;
+}
+
 static void generate_one_expert(expert_job *j, int xid) {
+    const int old_expert = reap_compact_old_expert_for_slot(j->reap, j->expert.layer, xid);
+    if (!reap_expert_slot_is_kept(j->reap, j->expert.layer, old_expert)) {
+        if (!j->zero_expert || j->zero_expert->size != j->per_expert) die("zero expert cache size mismatch");
+        memcpy(j->out->data + (size_t)xid * j->per_expert, j->zero_expert->data, j->zero_expert->size);
+        return;
+    }
+
     char prefix[256];
-    snprintf(prefix, sizeof(prefix), "layers.%d.ffn.experts.%d.%s", j->expert.layer, xid, j->wid);
+    snprintf(prefix, sizeof(prefix), "layers.%d.ffn.experts.%d.%s", j->expert.layer, old_expert, j->wid);
     char weight_name[320];
     char scale_name[320];
     snprintf(weight_name, sizeof(weight_name), "%s.weight", prefix);
@@ -1229,7 +1568,7 @@ static void generate_one_expert(expert_job *j, int xid) {
     int64_t n = 0;
     float *f32 = dequant_fp4_weight(&w, &s, &n);
     const char *names[3] = { j->gguf_name, weight_name, NULL };
-    const float *imat = imatrix_find(j->imatrix, names, 2, j->ncols, xid, j->n_experts);
+    const float *imat = imatrix_find(j->imatrix, names, 2, j->ncols, old_expert, j->original_expert_count);
     byte_buf q = f32_to_type(f32, n, j->target, j->ncols, imat);
     if (q.size != j->per_expert) die("expert quantized size mismatch");
     memcpy(j->out->data + (size_t)xid * j->per_expert, q.data, q.size);
@@ -1260,13 +1599,16 @@ static void *expert_worker(void *arg) {
 
 static byte_buf generate_expert(st_db *db, const char *gguf_name, const tensor_meta *tmpl,
                                 ds4q_type target, int n_experts, int n_threads,
-                                const imatrix_store *imatrix) {
+                                const imatrix_store *imatrix, const reap_plan *reap) {
     expert_tensor e = parse_expert_tensor(gguf_name);
     if (!e.is_expert) die("not an expert tensor");
     if (!is_quantizable_target(target)) die("unsupported expert target type");
     const char *wid = expert_part_name(e.part);
     const int64_t ncols = tmpl->ne[0];
     const int64_t nrows = tmpl->ne[1];
+    n_experts = (int)tmpl->ne[2];
+    const reap_layer_plan *lp = reap_layer_for(reap, e.layer);
+    const int original_expert_count = lp && lp->expert_count > 0 ? lp->expert_count : n_experts;
     const size_t per_expert = (size_t)nrows * ds4q_row_size(target, ncols);
     byte_buf out = { .size = per_expert * (size_t)n_experts, .data = xmalloc(per_expert * (size_t)n_experts) };
     ds4q_quantize_init(target);
@@ -1277,9 +1619,13 @@ static byte_buf generate_expert(st_db *db, const char *gguf_name, const tensor_m
             e.layer, wid, worker_count, worker_count == 1 ? "" : "s");
     expert_job job = {
         .db = db, .gguf_name = gguf_name, .tmpl = tmpl, .target = target,
-        .n_experts = n_experts, .imatrix = imatrix, .expert = e, .wid = wid,
+        .n_experts = n_experts, .imatrix = imatrix, .reap = reap, .expert = e, .wid = wid,
+        .original_expert_count = original_expert_count,
         .ncols = ncols, .nrows = nrows, .per_expert = per_expert, .out = &out,
     };
+    byte_buf zero_expert = generate_zero_expert(&job);
+    if (zero_expert.size != per_expert) die("zero expert quantized size mismatch");
+    job.zero_expert = &zero_expert;
     pthread_mutex_init(&job.lock, NULL);
     pthread_t *threads = xcalloc((size_t)worker_count, sizeof(threads[0]));
     for (int i = 1; i < worker_count; i++) pthread_create(&threads[i], NULL, expert_worker, &job);
@@ -1287,16 +1633,17 @@ static byte_buf generate_expert(st_db *db, const char *gguf_name, const tensor_m
     for (int i = 1; i < worker_count; i++) pthread_join(threads[i], NULL);
     pthread_mutex_destroy(&job.lock);
     free(threads);
+    free(zero_expert.data);
     return out;
 }
 
 static byte_buf generate_tensor(st_db *db, const char *name, const tensor_meta *tmpl,
                                 ds4q_type target, int n_experts, int n_threads,
-                                const imatrix_store *imatrix) {
+                                const imatrix_store *imatrix, const reap_plan *reap) {
     if (parse_expert_tensor(name).is_expert) {
-        return generate_expert(db, name, tmpl, target, n_experts, n_threads, imatrix);
+        return generate_expert(db, name, tmpl, target, n_experts, n_threads, imatrix, reap);
     }
-    return generate_regular(db, name, tmpl, target, imatrix);
+    return generate_regular(db, name, tmpl, target, imatrix, reap);
 }
 
 /* =====
@@ -1412,6 +1759,10 @@ static bool is_imatrix_kv_key(const char *key) {
     return str_starts(key, "quantize.imatrix.");
 }
 
+static bool is_reap_kv_key(const char *key) {
+    return str_starts(key, "reap.");
+}
+
 static size_t extra_imatrix_kv_size(const imatrix_store *im) {
     if (!imatrix_enabled(im)) return 0;
     size_t n = 0;
@@ -1447,6 +1798,88 @@ static void write_imatrix_kvs(FILE *fp, const imatrix_store *im) {
         write_u32(fp, GGUF_TYPE_UINT64);
         write_u64(fp, (uint64_t)im->chunks);
     }
+}
+
+static uint32_t reap_layer_keep_count(const reap_layer_plan *lp) {
+    if (!lp || !lp->present || lp->disabled || lp->expert_count <= 0) return 0;
+    uint32_t n = 0;
+    for (int e = 0; e < lp->expert_count; e++) {
+        if (!lp->has_keep_set || lp->keep_set[e]) n++;
+    }
+    return n;
+}
+
+static uint32_t reap_layer_policy(const reap_layer_plan *lp) {
+    if (!lp || !lp->present) return REAP_POLICY_NONE;
+    if (lp->disabled) return REAP_POLICY_MOE_DISABLED;
+    if (lp->hash_routed) return REAP_POLICY_HASH_PRESERVED;
+    if (lp->has_keep_set && lp->expert_count > 0 && reap_layer_keep_count(lp) < (uint32_t)lp->expert_count) {
+        return REAP_POLICY_ROUTER_MASK_PRUNED;
+    }
+    return REAP_POLICY_NONE;
+}
+
+static size_t extra_reap_array_u32_size(const char *key, uint64_t n) {
+    return gguf_string_size(key) + 4 + 4 + 8 + (size_t)n * sizeof(uint32_t);
+}
+
+static size_t extra_reap_kv_size(const reap_plan *reap) {
+    if (!reap || !reap->enabled) return 0;
+    size_t n = 0;
+    n += gguf_string_size(DS4_KV_REAP_ENABLED) + 4 + 1;
+    n += gguf_string_size(DS4_KV_REAP_LAYOUT) + 4 + gguf_string_size(DS4_REAP_LAYOUT_COMPACT);
+    if (reap->path) n += gguf_string_size(DS4_KV_REAP_PLAN_PATH) + 4 + gguf_string_size(reap->path);
+    n += extra_reap_array_u32_size(DS4_KV_REAP_LAYER_POLICY, DS4_REAP_N_LAYER);
+    n += extra_reap_array_u32_size(DS4_KV_REAP_LAYER_EXPERT_COUNT, DS4_REAP_N_LAYER);
+    n += extra_reap_array_u32_size(DS4_KV_REAP_LAYER_KEEP_COUNT, DS4_REAP_N_LAYER);
+    return n;
+}
+
+static uint64_t extra_reap_kv_count(const reap_plan *reap) {
+    if (!reap || !reap->enabled) return 0;
+    return 5 + (reap->path ? 1 : 0);
+}
+
+static void write_gguf_bool(FILE *fp, const char *key, bool value) {
+    uint8_t v = value ? 1u : 0u;
+    write_gguf_string(fp, key);
+    write_u32(fp, GGUF_TYPE_BOOL);
+    if (fwrite(&v, sizeof(v), 1, fp) != 1) die("write bool metadata failed");
+}
+
+static void write_gguf_string_kv(FILE *fp, const char *key, const char *value) {
+    write_gguf_string(fp, key);
+    write_u32(fp, GGUF_TYPE_STRING);
+    write_gguf_string(fp, value);
+}
+
+static void write_reap_u32_array(FILE *fp, const char *key, const uint32_t *values, uint64_t n) {
+    write_gguf_string(fp, key);
+    write_u32(fp, GGUF_TYPE_ARRAY);
+    write_u32(fp, GGUF_TYPE_UINT32);
+    write_u64(fp, n);
+    for (uint64_t i = 0; i < n; i++) write_u32(fp, values[i]);
+}
+
+static void write_reap_kvs(FILE *fp, const reap_plan *reap) {
+    if (!reap || !reap->enabled) return;
+
+    uint32_t policy[DS4_REAP_N_LAYER] = {0};
+    uint32_t expert_count[DS4_REAP_N_LAYER] = {0};
+    uint32_t keep_count[DS4_REAP_N_LAYER] = {0};
+    for (uint32_t il = 0; il < DS4_REAP_N_LAYER; il++) {
+        const reap_layer_plan *lp = reap_layer_for(reap, (int)il);
+        policy[il] = reap_layer_policy(lp);
+        expert_count[il] = lp && lp->expert_count > 0 ? (uint32_t)lp->expert_count : 0;
+        keep_count[il] = reap_layer_keep_count(lp);
+    }
+
+    write_gguf_bool(fp, DS4_KV_REAP_ENABLED, true);
+    write_gguf_string_kv(fp, DS4_KV_REAP_LAYOUT, DS4_REAP_LAYOUT_COMPACT);
+    if (reap->path) write_gguf_string_kv(fp, DS4_KV_REAP_PLAN_PATH, reap->path);
+    write_reap_u32_array(fp, DS4_KV_REAP_LAYER_POLICY, policy, DS4_REAP_N_LAYER);
+    write_reap_u32_array(fp, DS4_KV_REAP_LAYER_EXPERT_COUNT, expert_count, DS4_REAP_N_LAYER);
+    write_reap_u32_array(fp, DS4_KV_REAP_LAYER_KEEP_COUNT, keep_count, DS4_REAP_N_LAYER);
 }
 
 static gguf_file load_gguf_metadata(const char *path) {
@@ -1487,7 +1920,7 @@ static gguf_file load_gguf_metadata(const char *path) {
          * otherwise the output can contain duplicate GGUF metadata with stale
          * and new values.
          */
-        if (!is_imatrix_kv_key(key)) {
+        if (!is_imatrix_kv_key(key) && !is_reap_kv_key(key)) {
             kv_keep[n_kv_keep++] = (byte_span){
                 .start = (size_t)(rec_start - kv_start),
                 .end = (size_t)(rec_end - kv_start),
@@ -1562,10 +1995,11 @@ static uint64_t fnv1a64_bytes(const uint8_t *data, size_t n) {
     return h;
 }
 
-static output_context build_output_context(const gguf_file *tmpl, const quant_policy *policy, const imatrix_store *im) {
+static output_context build_output_context(const gguf_file *tmpl, const quant_policy *policy,
+                                           const imatrix_store *im, const reap_plan *reap) {
     output_context out = {0};
     out.n_tensors = tmpl->n_tensors;
-    out.n_kv_extra = extra_imatrix_kv_count(im);
+    out.n_kv_extra = extra_imatrix_kv_count(im) + extra_reap_kv_count(reap);
     out.alignment = tmpl->alignment;
     out.tensors = xcalloc((size_t)out.n_tensors, sizeof(out.tensors[0]));
     size_t tensor_info = 0;
@@ -1578,15 +2012,29 @@ static output_context build_output_context(const gguf_file *tmpl, const quant_po
         ds4q_type type = policy_type(policy, src->name, src);
         if (type == DS4Q_TYPE_COUNT) type = src->type;
         if (type != DS4Q_TYPE_I32 && !is_quantizable_target(type)) die("unsupported planned tensor type");
-        if (ds4q_can_quantize(type) && src->ne[0] % ds4q_block_size(type) != 0) die("ne[0] not divisible by block size");
+        int reap_layer = -1;
+        expert_tensor exp = parse_expert_tensor(src->name);
+        if (reap && reap->enabled && exp.is_expert) {
+            dst->ne[2] = reap_layer_physical_expert_count(reap, exp.layer, (int)src->ne[2]);
+        } else if (reap && reap->enabled && reap_router_weight_tensor(src->name, &reap_layer)) {
+            dst->ne[1] = reap_layer_physical_expert_count(reap, reap_layer, (int)src->ne[1]);
+        } else if (reap && reap->enabled && reap_router_bias_tensor(src->name, &reap_layer)) {
+            dst->ne[0] = reap_layer_physical_expert_count(reap, reap_layer, (int)src->ne[0]);
+        } else if (reap && reap->enabled && reap_disabled_shared_expert_tensor(reap, src->name, &reap_layer)) {
+            (void)reap_layer;
+            dst->ne[1] = 0;
+        }
+        if (ds4q_can_quantize(type) && dst->ne[0] % ds4q_block_size(type) != 0) die("ne[0] not divisible by block size");
         dst->type = type;
-        dst->size = tensor_nbytes(type, src->ne, src->n_dims);
+        dst->size = tensor_nbytes(type, dst->ne, dst->n_dims);
         dst->new_offset = off;
         off += ds4q_pad(dst->size, tmpl->alignment);
         tensor_info += gguf_string_size(dst->name) + 4 + (size_t)dst->n_dims * 8 + 4 + 8;
     }
     out.tensor_bytes = off;
-    out.meta_size = 4 + 4 + 8 + 8 + tmpl->kv_raw_len + extra_imatrix_kv_size(im) + tensor_info;
+    out.meta_size = 4 + 4 + 8 + 8 + tmpl->kv_raw_len +
+                    extra_imatrix_kv_size(im) + extra_reap_kv_size(reap) +
+                    tensor_info;
     out.data_offset = ds4q_pad(out.meta_size, tmpl->alignment);
     return out;
 }
@@ -1602,7 +2050,7 @@ static void write_padding(FILE *fp, size_t n) {
 
 static void write_full_gguf(st_db *db, const gguf_file *tmpl, const output_context *out_ctx,
                             const char *out_path, int n_experts, int n_threads,
-                            const imatrix_store *imatrix) {
+                            const imatrix_store *imatrix, const reap_plan *reap) {
     FILE *fp = fopen(out_path, "wb");
     if (!fp) die_errno("open output", out_path);
     if (fwrite("GGUF", 1, 4, fp) != 4) die("write GGUF magic failed");
@@ -1611,6 +2059,7 @@ static void write_full_gguf(st_db *db, const gguf_file *tmpl, const output_conte
     write_u64(fp, tmpl->n_kv + out_ctx->n_kv_extra);
     if (fwrite(tmpl->kv_raw, 1, tmpl->kv_raw_len, fp) != tmpl->kv_raw_len) die("write GGUF KV failed");
     write_imatrix_kvs(fp, imatrix);
+    write_reap_kvs(fp, reap);
     for (uint64_t i = 0; i < out_ctx->n_tensors; i++) {
         const tensor_meta *t = &out_ctx->tensors[i];
         write_gguf_string(fp, t->name);
@@ -1625,10 +2074,9 @@ static void write_full_gguf(st_db *db, const gguf_file *tmpl, const output_conte
     write_padding(fp, out_ctx->data_offset - (size_t)pos);
 
     for (uint64_t i = 0; i < out_ctx->n_tensors; i++) {
-        const tensor_meta *src = &tmpl->tensors[i];
         const tensor_meta *dst = &out_ctx->tensors[i];
         fprintf(stderr, "[%4" PRIu64 "/%4" PRIu64 "] %s -> %s\n", i + 1, out_ctx->n_tensors, dst->name, ds4q_type_name(dst->type));
-        byte_buf data = generate_tensor(db, dst->name, src, dst->type, n_experts, n_threads, imatrix);
+        byte_buf data = generate_tensor(db, dst->name, dst, dst->type, n_experts, n_threads, imatrix, reap);
         size_t expected = dst->size;
         if (data.size != expected) {
             fprintf(stderr, "error: generated size mismatch for %s: got %zu expected %zu\n", dst->name, data.size, expected);
@@ -1673,6 +2121,7 @@ typedef struct {
     char *compare_gguf;
     char *compare_tensor;
     char *imatrix_file;
+    char *reap_plan_file;
     quant_policy policy;
     int n_experts;
     int n_threads;
@@ -1694,6 +2143,7 @@ static void usage(const char *argv0) {
     printf("  --dry-run              print output plan without reading HF tensor data\n");
     printf("  --imatrix FILE         legacy .dat imatrix from ds4 --imatrix-out\n");
     printf("  --imatrix-strict       fail if a quantized tensor has no matching imatrix vector\n");
+    printf("  --reap-plan FILE       REAP mask plan; writes a compact ds4_reap layout with pruned experts removed\n");
     printf("  --experts TYPE         set routed w1/w2/w3 expert tensors to TYPE\n");
     printf("  --routed-w1 TYPE       routed gate expert tensor type\n");
     printf("  --routed-w2 TYPE       routed down expert tensor type\n");
@@ -1756,6 +2206,8 @@ static params parse_args(int argc, char **argv) {
             p.imatrix_file = need_value(argc, argv, &i, arg);
         } else if (strcmp(arg, "--imatrix-strict") == 0) {
             p.imatrix_strict = true;
+        } else if (strcmp(arg, "--reap-plan") == 0) {
+            p.reap_plan_file = need_value(argc, argv, &i, arg);
         } else if (strcmp(arg, "--experts") == 0 || strcmp(arg, "--routed") == 0) {
             ds4q_type t = parse_type(need_value(argc, argv, &i, arg));
             p.policy.routed_w1 = p.policy.routed_w2 = p.policy.routed_w3 = t;
@@ -1811,7 +2263,7 @@ static void free_gguf_file(gguf_file *g) {
 }
 
 static void compare_one_tensor(st_db *db, const gguf_file *tmpl, const output_context *out_ctx,
-                               const params *p, const imatrix_store *imatrix) {
+                               const params *p, const imatrix_store *imatrix, const reap_plan *reap) {
     int idx = hmap_get(&tmpl->tensor_map, p->compare_tensor);
     if (idx < 0) {
         fprintf(stderr, "error: tensor not found in template: %s\n", p->compare_tensor);
@@ -1820,7 +2272,7 @@ static void compare_one_tensor(st_db *db, const gguf_file *tmpl, const output_co
     fprintf(stderr, "regenerating %s as %s\n",
             p->compare_tensor, ds4q_type_name(out_ctx->tensors[idx].type));
     byte_buf generated = generate_tensor(db, p->compare_tensor, &tmpl->tensors[idx],
-                                         out_ctx->tensors[idx].type, p->n_experts, p->n_threads, imatrix);
+                                         out_ctx->tensors[idx].type, p->n_experts, p->n_threads, imatrix, reap);
     gguf_file ref = load_gguf_metadata(p->compare_gguf);
     byte_buf reference = read_gguf_tensor_data(&ref, p->compare_gguf, p->compare_tensor);
     printf("tensor: %s\n", p->compare_tensor);
@@ -1856,27 +2308,34 @@ int main(int argc, char **argv) {
     params p = parse_args(argc, argv);
     imatrix_store imatrix = {0};
     if (p.imatrix_file) imatrix_load(&imatrix, p.imatrix_file, p.imatrix_strict);
+    reap_plan reap = {0};
+    reap_load_plan(&reap, p.reap_plan_file);
 
     gguf_file tmpl = load_gguf_metadata(p.template_gguf);
-    output_context out_ctx = build_output_context(&tmpl, &p.policy, &imatrix);
+    output_context out_ctx = build_output_context(&tmpl, &p.policy, &imatrix, &reap);
     print_plan(&tmpl, &out_ctx);
-    if (p.dry_run) return 0;
+    if (p.dry_run) {
+        reap_plan_free(&reap);
+        return 0;
+    }
 
     st_db db;
     db_open(&db, p.hf_dir);
     if (p.compare_tensor) {
-        compare_one_tensor(&db, &tmpl, &out_ctx, &p, &imatrix);
+        compare_one_tensor(&db, &tmpl, &out_ctx, &p, &imatrix, &reap);
         db_close(&db);
         imatrix_free(&imatrix);
+        reap_plan_free(&reap);
         free_gguf_file(&tmpl);
         free(out_ctx.tensors);
         return 0;
     }
-    write_full_gguf(&db, &tmpl, &out_ctx, p.out_gguf, p.n_experts, p.n_threads, &imatrix);
+    write_full_gguf(&db, &tmpl, &out_ctx, p.out_gguf, p.n_experts, p.n_threads, &imatrix, &reap);
     fprintf(stderr, "wrote %s\n", p.out_gguf);
 
     db_close(&db);
     imatrix_free(&imatrix);
+    reap_plan_free(&reap);
     free_gguf_file(&tmpl);
     free(out_ctx.tensors);
     for (int i = 0; i < p.policy.n_overrides; i++) free(p.policy.overrides[i].prefix);

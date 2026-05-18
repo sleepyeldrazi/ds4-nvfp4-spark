@@ -38,6 +38,10 @@ typedef struct {
     const char *imatrix_output_path;
     int imatrix_max_prompts;
     int imatrix_max_tokens;
+    const char *reap_observe_dataset_path;
+    const char *reap_observe_output_path;
+    int reap_observe_max_prompts;
+    int reap_observe_max_tokens;
     ds4_think_mode think_mode;
     bool head_test;
     bool first_token_test;
@@ -165,6 +169,14 @@ static void usage(FILE *fp) {
         "      Stop imatrix collection after N prompts. Default: no prompt limit\n"
         "  --imatrix-max-tokens N\n"
         "      Stop imatrix collection after N prompt tokens. Default: no token limit\n"
+        "  --reap-observe-dataset FILE\n"
+        "      Rendered DS4 prompt dataset used for separated REAP observation.\n"
+        "  --reap-observe-out FILE\n"
+        "      Collect routed expert activation scores and write REAP observation JSON.\n"
+        "  --reap-observe-max-prompts N\n"
+        "      Stop REAP observation after N prompts. Default: no prompt limit\n"
+        "  --reap-observe-max-tokens N\n"
+        "      Stop REAP observation after N prompt tokens. Default: no token limit\n"
         "  --head-test\n"
         "      Run the output HC/logits head after the native slice.\n"
         "  --first-token-test\n"
@@ -1277,6 +1289,15 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.imatrix_max_prompts = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--imatrix-max-tokens")) {
             c.gen.imatrix_max_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--reap-observe-dataset")) {
+            c.gen.reap_observe_dataset_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--reap-observe-out")) {
+            c.gen.reap_observe_output_path = need_arg(&i, argc, argv, arg);
+            c.engine.backend = DS4_BACKEND_METAL;
+        } else if (!strcmp(arg, "--reap-observe-max-prompts")) {
+            c.gen.reap_observe_max_prompts = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--reap-observe-max-tokens")) {
+            c.gen.reap_observe_max_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--think")) {
             c.gen.think_mode = DS4_THINK_HIGH;
         } else if (!strcmp(arg, "--think-max")) {
@@ -1324,6 +1345,14 @@ static cli_config parse_options(int argc, char **argv) {
         fprintf(stderr, "ds4: --imatrix-dataset requires --imatrix-out\n");
         exit(2);
     }
+    if (c.gen.reap_observe_output_path && !c.gen.reap_observe_dataset_path) {
+        fprintf(stderr, "ds4: --reap-observe-out requires --reap-observe-dataset\n");
+        exit(2);
+    }
+    if (c.gen.reap_observe_dataset_path && !c.gen.reap_observe_output_path) {
+        fprintf(stderr, "ds4: --reap-observe-dataset requires --reap-observe-out\n");
+        exit(2);
+    }
 
     return c;
 }
@@ -1361,6 +1390,13 @@ int main(int argc, char **argv) {
                                         cfg.gen.ctx_size,
                                         cfg.gen.imatrix_max_prompts,
                                         cfg.gen.imatrix_max_tokens);
+    } else if (cfg.gen.reap_observe_output_path) {
+        rc = ds4_engine_collect_reap_observations(engine,
+                                                 cfg.gen.reap_observe_dataset_path,
+                                                 cfg.gen.reap_observe_output_path,
+                                                 cfg.gen.ctx_size,
+                                                 cfg.gen.reap_observe_max_prompts,
+                                                 cfg.gen.reap_observe_max_tokens);
     } else if (cfg.gen.prompt == NULL) {
         rc = run_repl(engine, &cfg);
     } else {

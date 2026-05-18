@@ -12,3 +12,31 @@
 /misc/
 .*.swp
 .DS_Store
+
+# Python/local tooling
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.env
+.env.*
+
+# Local caches/logs
+.cache/
+*.log
+*.tmp
+*.bak
+
+# Large/generated model artifacts outside gguf/
+*.gguf
+*.safetensors
+*.pt
+*.pth
+*.bin
+
+# macOS/editor
+.AppleDouble
+.LSOverride
+*.swp
+*.swo

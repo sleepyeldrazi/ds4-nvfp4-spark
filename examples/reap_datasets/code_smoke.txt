@@ -1,0 +1,4 @@
+===== DS4_IMATRIX_PROMPT 1 =====
+User: Write a short Python function that checks whether a list is sorted.
+Assistant:
+

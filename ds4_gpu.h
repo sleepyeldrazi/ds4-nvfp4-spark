@@ -247,6 +247,39 @@ int ds4_gpu_dsv4_fp8_kv_quantize_tensor(
         uint32_t          head_dim,
         uint32_t          n_rot);
 
+/* Experimental compressed-cache quantizer wrapper. Baseline stays FP8; setting
+ * DS4_KV_TURBO=v4 routes only compressed KV rows through the fake turbo4
+ * round-trip while leaving raw/current KV paths unchanged.  DS4_KV_TURBO=packv3,
+ * packv3n, or packv4 stores attention-compressed rows in a packed TurboQuant
+ * form, materializing fp32 rows only into scratch when a non-packed attention
+ * path or snapshot needs them.  Sparse decode attention consumes the packed
+ * cache in rotated domain. */
+int ds4_gpu_dsv4_compressed_kv_quantize_tensor(
+        ds4_gpu_tensor *x,
+        uint32_t          n_tok,
+        uint32_t          head_dim,
+        uint32_t          n_rot);
+
+bool ds4_gpu_dsv4_turbo4_packv4_enabled(void);
+uint64_t ds4_gpu_dsv4_turbo4_packed_kv_row_bytes(uint32_t head_dim, uint32_t n_rot);
+uint64_t ds4_gpu_dsv4_turbo4_packed_kv_bytes(uint32_t n_rows, uint32_t head_dim, uint32_t n_rot);
+int ds4_gpu_dsv4_turbo4_pack_compressed_kv_tensor(
+        ds4_gpu_tensor       *packed,
+        const ds4_gpu_tensor *src,
+        uint32_t                dst_row0,
+        uint32_t                src_row0,
+        uint32_t                n_rows,
+        uint32_t                head_dim,
+        uint32_t                n_rot);
+int ds4_gpu_dsv4_turbo4_unpack_compressed_kv_tensor(
+        ds4_gpu_tensor       *dst,
+        const ds4_gpu_tensor *packed,
+        uint32_t                dst_row0,
+        uint32_t                src_row0,
+        uint32_t                n_rows,
+        uint32_t                head_dim,
+        uint32_t                n_rot);
+
 int ds4_gpu_rope_tail_tensor(
         ds4_gpu_tensor *x,
         uint32_t          n_tok,
@@ -493,6 +526,27 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         uint32_t                n_head,
         uint32_t                head_dim);
 
+int ds4_gpu_attention_indexed_mixed_batch_heads_turbo4_tensor(
+        ds4_gpu_tensor       *heads,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv,
+        const ds4_gpu_tensor *comp_kv,
+        const ds4_gpu_tensor *topk,
+        uint32_t                n_tokens,
+        uint32_t                pos0,
+        uint32_t                n_raw,
+        uint32_t                raw_cap,
+        uint32_t                raw_start,
+        uint32_t                n_comp,
+        uint32_t                top_k,
+        uint32_t                window,
+        uint32_t                ratio,
+        uint32_t                n_head,
+        uint32_t                head_dim);
+
 int ds4_gpu_attention_prefill_static_mixed_heads_tensor(
         ds4_gpu_tensor       *heads,
         const void             *model_map,
@@ -590,6 +644,7 @@ int ds4_gpu_router_select_tensor(
         uint64_t                hash_offset,
         uint32_t                hash_rows,
         uint32_t                token,
+        uint32_t                n_expert,
         uint32_t                n_expert_groups,
         uint32_t                n_group_used,
         bool                    has_bias,
@@ -605,6 +660,7 @@ int ds4_gpu_router_select_batch_tensor(
         uint64_t                bias_offset,
         uint64_t                hash_offset,
         uint32_t                hash_rows,
+        uint32_t                n_expert,
         uint32_t                n_expert_groups,
         uint32_t                n_group_used,
         bool                    has_bias,
@@ -633,6 +689,7 @@ int ds4_gpu_routed_moe_one_tensor(
         uint32_t                expert_in_dim,
         uint32_t                expert_mid_dim,
         uint32_t                out_dim,
+        uint32_t                stored_experts,
         const ds4_gpu_tensor *selected,
         const ds4_gpu_tensor *weights,
         uint32_t                n_expert,
@@ -659,6 +716,7 @@ int ds4_gpu_routed_moe_batch_tensor(
         uint32_t                expert_in_dim,
         uint32_t                expert_mid_dim,
         uint32_t                out_dim,
+        uint32_t                stored_experts,
         const ds4_gpu_tensor *selected,
         const ds4_gpu_tensor *weights,
         uint32_t                n_expert,

@@ -27,6 +27,19 @@ struct ds4_metal_args_dsv4_kv_fp8_store {
     int32_t raw_row;
 };
 
+struct ds4_metal_args_dsv4_turbo4_packed_kv {
+    uint32_t head_dim;
+    uint32_t n_rot;
+    uint32_t n_rows;
+    uint32_t src_row0;
+    uint32_t dst_row0;
+    uint32_t mode;
+    uint32_t reserved;
+    ulong src_row_bytes;
+    ulong dst_row_bytes;
+    ulong packed_row_bytes;
+};
+
 struct ds4_metal_args_dsv4_ratio4_shift {
     uint32_t width;
 };
@@ -76,6 +89,7 @@ static inline float dsv4_e4m3fn_dequant(float x) {
 // Quantizes the non-RoPE part of a KV row through E4M3FN and writes the
 // dequantized value back as float. DS4 uses this to match the FP8 KV-cache
 // semantics while keeping the Metal graph's cache buffers float-addressable.
+
 kernel void kernel_dsv4_fp8_kv_quantize_f32(
         constant ds4_metal_args_dsv4_fp8_kv_quantize & args,
         device  const char * src0,
@@ -125,6 +139,517 @@ kernel void kernel_dsv4_fp8_kv_quantize_f32(
         *((device float *) (dst_base + i*args.nb0)) = *((device const float *) (src_base + i*args.nb00));
     }
 }
+
+constant float dsv4_turbo4_fake_centroids[16] = {
+    -0.173926f, -0.117195f, -0.089527f, -0.068756f,
+    -0.051262f, -0.035597f, -0.020989f, -0.006938f,
+     0.006938f,  0.020989f,  0.035597f,  0.051262f,
+     0.068756f,  0.089527f,  0.117195f,  0.173926f
+};
+
+constant float dsv4_turbo3_centroids[8] = {
+    -0.190685f, -0.117832f, -0.065717f, -0.021460f,
+     0.021460f,  0.065717f,  0.117832f,  0.190685f
+};
+
+constant float dsv4_turbo_rht_s1[128] = {
+    -1.0f,  1.0f,  1.0f, -1.0f, -1.0f,  1.0f, -1.0f,  1.0f,
+    -1.0f, -1.0f,  1.0f,  1.0f,  1.0f,  1.0f,  1.0f,  1.0f,
+     1.0f, -1.0f,  1.0f, -1.0f,  1.0f, -1.0f, -1.0f,  1.0f,
+     1.0f,  1.0f, -1.0f,  1.0f,  1.0f, -1.0f, -1.0f, -1.0f,
+    -1.0f,  1.0f,  1.0f, -1.0f,  1.0f,  1.0f, -1.0f,  1.0f,
+    -1.0f,  1.0f,  1.0f, -1.0f, -1.0f,  1.0f, -1.0f,  1.0f,
+     1.0f,  1.0f,  1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f,
+     1.0f, -1.0f,  1.0f,  1.0f,  1.0f,  1.0f, -1.0f,  1.0f,
+    -1.0f, -1.0f,  1.0f, -1.0f, -1.0f, -1.0f,  1.0f, -1.0f,
+    -1.0f, -1.0f,  1.0f, -1.0f, -1.0f, -1.0f,  1.0f,  1.0f,
+     1.0f, -1.0f, -1.0f,  1.0f,  1.0f,  1.0f, -1.0f, -1.0f,
+     1.0f,  1.0f, -1.0f,  1.0f,  1.0f, -1.0f,  1.0f, -1.0f,
+    -1.0f,  1.0f,  1.0f, -1.0f,  1.0f, -1.0f,  1.0f, -1.0f,
+     1.0f,  1.0f,  1.0f,  1.0f, -1.0f,  1.0f, -1.0f,  1.0f,
+     1.0f, -1.0f,  1.0f,  1.0f, -1.0f, -1.0f, -1.0f, -1.0f,
+    -1.0f,  1.0f,  1.0f, -1.0f,  1.0f,  1.0f, -1.0f,  1.0f
+};
+
+constant float dsv4_turbo_rht_s2[128] = {
+     1.0f,  1.0f,  1.0f,  1.0f, -1.0f,  1.0f,  1.0f, -1.0f,
+     1.0f, -1.0f, -1.0f, -1.0f,  1.0f, -1.0f, -1.0f, -1.0f,
+     1.0f,  1.0f, -1.0f, -1.0f,  1.0f, -1.0f,  1.0f, -1.0f,
+     1.0f, -1.0f, -1.0f,  1.0f, -1.0f,  1.0f,  1.0f,  1.0f,
+     1.0f,  1.0f, -1.0f, -1.0f, -1.0f,  1.0f, -1.0f, -1.0f,
+    -1.0f, -1.0f, -1.0f, -1.0f,  1.0f,  1.0f,  1.0f, -1.0f,
+     1.0f, -1.0f,  1.0f,  1.0f,  1.0f, -1.0f, -1.0f,  1.0f,
+    -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f,  1.0f,  1.0f,
+     1.0f, -1.0f,  1.0f, -1.0f, -1.0f, -1.0f, -1.0f,  1.0f,
+    -1.0f,  1.0f, -1.0f,  1.0f, -1.0f, -1.0f,  1.0f,  1.0f,
+    -1.0f,  1.0f, -1.0f,  1.0f,  1.0f, -1.0f,  1.0f, -1.0f,
+    -1.0f, -1.0f, -1.0f,  1.0f, -1.0f, -1.0f,  1.0f, -1.0f,
+     1.0f, -1.0f,  1.0f,  1.0f,  1.0f, -1.0f, -1.0f,  1.0f,
+    -1.0f,  1.0f, -1.0f,  1.0f,  1.0f, -1.0f, -1.0f,  1.0f,
+    -1.0f,  1.0f, -1.0f,  1.0f,  1.0f, -1.0f,  1.0f, -1.0f,
+     1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f,  1.0f, -1.0f
+};
+
+static inline uint dsv4_turbo4_fake_centroid_index(float x) {
+    uint best = 0;
+    float best_d = abs(x - dsv4_turbo4_fake_centroids[0]);
+    for (uint i = 1; i < 16; i++) {
+        float d = abs(x - dsv4_turbo4_fake_centroids[i]);
+        if (d < best_d) {
+            best_d = d;
+            best = i;
+        }
+    }
+    return best;
+}
+
+static inline float dsv4_turbo4_fake_centroid(float x) {
+    return dsv4_turbo4_fake_centroids[dsv4_turbo4_fake_centroid_index(x)];
+}
+
+static inline uint dsv4_turbo3_centroid_index(float x) {
+    if (x < -0.154259f) return 0u;
+    if (x < -0.091775f) return 1u;
+    if (x < -0.043589f) return 2u;
+    if (x <  0.000000f) return 3u;
+    if (x <  0.043589f) return 4u;
+    if (x <  0.091775f) return 5u;
+    if (x <  0.154259f) return 6u;
+    return 7u;
+}
+
+static inline void dsv4_turbo_fwht_128(thread float x[128]) {
+    for (uint len = 1; len < 128; len <<= 1) {
+        for (uint i = 0; i < 128; i += (len << 1)) {
+            for (uint j = 0; j < len; j++) {
+                float a = x[i + j];
+                float b = x[i + j + len];
+                x[i + j] = a + b;
+                x[i + j + len] = a - b;
+            }
+        }
+    }
+
+    const float scale = 0.08838834764831845f; // 1 / sqrt(128)
+    for (uint i = 0; i < 128; i++) {
+        x[i] *= scale;
+    }
+}
+
+static inline void dsv4_turbo_rht_128_forward(thread float x[128]) {
+    for (uint i = 0; i < 128; i++) {
+        x[i] *= dsv4_turbo_rht_s1[i];
+    }
+    dsv4_turbo_fwht_128(x);
+    for (uint i = 0; i < 128; i++) {
+        x[i] *= dsv4_turbo_rht_s2[i];
+    }
+}
+
+static inline void dsv4_turbo_rht_128_inverse(thread float x[128]) {
+    for (uint i = 0; i < 128; i++) {
+        x[i] *= dsv4_turbo_rht_s2[i];
+    }
+    dsv4_turbo_fwht_128(x);
+    for (uint i = 0; i < 128; i++) {
+        x[i] *= dsv4_turbo_rht_s1[i];
+    }
+}
+
+kernel void kernel_dsv4_turbo4_pack_f32(
+        constant ds4_metal_args_dsv4_turbo4_packed_kv & args,
+        device const uchar * src,
+        device       uchar * dst,
+        uint gid [[thread_position_in_grid]]) {
+    uint row = gid;
+    uint turbo3_block = 0u;
+    uint turbo3_begin = 0u;
+    uint turbo3_end = 0u;
+    if (args.mode == 3u) {
+        if ((args.head_dim & 127u) != 0u) {
+            return;
+        }
+        const uint blocks = args.head_dim / 128u;
+        if (blocks == 0u) {
+            return;
+        }
+        if (args.reserved != 0u) {
+            row = gid / blocks;
+            turbo3_block = gid - row * blocks;
+            turbo3_begin = turbo3_block;
+            turbo3_end = turbo3_block + 1u;
+        } else {
+            row = gid;
+            turbo3_begin = 0u;
+            turbo3_end = blocks;
+        }
+    }
+    if (row >= args.n_rows || args.head_dim == 0 || args.n_rot > args.head_dim) {
+        return;
+    }
+
+    const uint n_nope = args.head_dim - args.n_rot;
+    const uint full_end = (n_nope / 128u) * 128u;
+    const uint n_blocks = full_end / 128u;
+
+    device const uchar * src_row = src + ((ulong)args.src_row0 + row) * args.src_row_bytes;
+    device       uchar * dst_row = dst + ((ulong)args.dst_row0 + row) * args.packed_row_bytes;
+
+    if (args.mode == 5u) {
+        for (uint block = 0; block < n_blocks; block++) {
+            const uint off = block * 128u;
+            float norm_sq = 0.0f;
+            float v[128];
+
+            for (uint i = 0; i < 128u; i++) {
+                const float x = *((device const float *)(src_row + (off + i) * sizeof(float)));
+                v[i] = x;
+                norm_sq += x * x;
+            }
+
+            const float norm = sqrt(norm_sq);
+            const float inv_norm = norm > 1.0e-10f ? 1.0f / norm : 0.0f;
+            for (uint i = 0; i < 128u; i++) {
+                v[i] *= inv_norm;
+            }
+
+            dsv4_turbo_rht_128_forward(v);
+
+            uint qidx[128];
+            float recon_sq = 0.0f;
+            for (uint i = 0; i < 128u; i++) {
+                const uint idx = dsv4_turbo3_centroid_index(v[i]);
+                const float q = dsv4_turbo3_centroids[idx];
+                qidx[i] = idx;
+                recon_sq += q * q;
+            }
+
+            const float recon_norm = sqrt(recon_sq);
+            const float corrected = recon_norm > 1.0e-10f ? norm / recon_norm : norm;
+            device uchar * out_block = dst_row + (ulong)block * 50ul;
+            *((device half *)out_block) = half(corrected);
+            device uchar * qs = out_block + sizeof(half);
+            device uchar * signs = qs + 32ul;
+
+            for (uint i = 0; i < 32u; i++) {
+                qs[i] = (uchar)((qidx[i * 4u + 0u] & 0x03u) |
+                                ((qidx[i * 4u + 1u] & 0x03u) << 2u) |
+                                ((qidx[i * 4u + 2u] & 0x03u) << 4u) |
+                                ((qidx[i * 4u + 3u] & 0x03u) << 6u));
+            }
+            for (uint i = 0; i < 16u; i++) {
+                uchar bits = 0;
+                for (uint j = 0; j < 8u; j++) {
+                    bits |= (uchar)(((qidx[i * 8u + j] >> 2u) & 0x01u) << j);
+                }
+                signs[i] = bits;
+            }
+        }
+
+        device uchar * tail = dst_row + (ulong)n_blocks * 50ul;
+        for (uint i = full_end; i < args.head_dim; i++) {
+            *((device float *)(tail + (ulong)(i - full_end) * sizeof(float))) =
+                *((device const float *)(src_row + (ulong)i * sizeof(float)));
+        }
+        return;
+    }
+
+    if (args.mode == 3u) {
+        for (uint block = turbo3_begin; block < turbo3_end; block++) {
+        const uint off = block * 128u;
+        float norm_sq = 0.0f;
+        float v[128];
+
+        for (uint i = 0; i < 128u; i++) {
+            const float x = *((device const float *)(src_row + (off + i) * sizeof(float)));
+            v[i] = x;
+            norm_sq += x * x;
+        }
+
+        const float norm = sqrt(norm_sq);
+        const float inv_norm = norm > 1.0e-10f ? 1.0f / norm : 0.0f;
+        for (uint i = 0; i < 128u; i++) {
+            v[i] *= inv_norm;
+        }
+
+        dsv4_turbo_rht_128_forward(v);
+
+        uint qidx[128];
+        float recon_sq = 0.0f;
+        for (uint i = 0; i < 128u; i++) {
+            const uint idx = dsv4_turbo3_centroid_index(v[i]);
+            const float q = dsv4_turbo3_centroids[idx];
+            qidx[i] = idx;
+            recon_sq += q * q;
+        }
+
+        const float recon_norm = sqrt(recon_sq);
+        const float corrected = recon_norm > 1.0e-10f ? norm / recon_norm : norm;
+        device uchar * out_block = dst_row + (ulong)block * 50ul;
+        *((device half *)out_block) = half(corrected);
+        device uchar * qs = out_block + sizeof(half);
+        device uchar * signs = qs + 32ul;
+
+        for (uint i = 0; i < 32u; i++) {
+            qs[i] = (uchar)((qidx[i * 4u + 0u] & 0x03u) |
+                            ((qidx[i * 4u + 1u] & 0x03u) << 2u) |
+                            ((qidx[i * 4u + 2u] & 0x03u) << 4u) |
+                            ((qidx[i * 4u + 3u] & 0x03u) << 6u));
+        }
+        for (uint i = 0; i < 16u; i++) {
+            uchar bits = 0;
+            for (uint j = 0; j < 8u; j++) {
+                bits |= (uchar)(((qidx[i * 8u + j] >> 2u) & 0x01u) << j);
+            }
+            signs[i] = bits;
+        }
+        }
+        return;
+    }
+
+    for (uint block = 0; block < n_blocks; block++) {
+        const uint off = block * 128u;
+        float norm_sq = 0.0f;
+        float v[128];
+
+        for (uint i = 0; i < 128u; i++) {
+            const float x = *((device const float *)(src_row + (off + i) * sizeof(float)));
+            v[i] = x;
+            norm_sq += x * x;
+        }
+
+        const float norm = sqrt(norm_sq);
+        const float inv_norm = norm > 1.0e-10f ? 1.0f / norm : 0.0f;
+        for (uint i = 0; i < 128u; i++) {
+            v[i] *= inv_norm;
+        }
+
+        dsv4_turbo_fwht_128(v);
+
+        uint qidx[128];
+        float recon_sq = 0.0f;
+        for (uint i = 0; i < 128u; i++) {
+            const uint idx = dsv4_turbo4_fake_centroid_index(v[i]);
+            const float q = dsv4_turbo4_fake_centroids[idx];
+            qidx[i] = idx;
+            recon_sq += q * q;
+        }
+
+        const float recon_norm = sqrt(recon_sq);
+        const float corrected = recon_norm > 1.0e-10f ? norm / recon_norm : norm;
+        device uchar * out_block = dst_row + (ulong)block * 68ul;
+        *((device float *)out_block) = corrected;
+        device uchar * qs = out_block + sizeof(float);
+        for (uint i = 0; i < 64u; i++) {
+            qs[i] = (uchar)((qidx[i * 2u] & 0x0fu) | ((qidx[i * 2u + 1u] & 0x0fu) << 4));
+        }
+    }
+
+    device uchar * tail = dst_row + (ulong)n_blocks * 68ul;
+    for (uint i = full_end; i < args.head_dim; i++) {
+        *((device float *)(tail + (ulong)(i - full_end) * sizeof(float))) =
+            *((device const float *)(src_row + (ulong)i * sizeof(float)));
+    }
+}
+
+kernel void kernel_dsv4_turbo4_unpack_f32(
+        constant ds4_metal_args_dsv4_turbo4_packed_kv & args,
+        device const uchar * src,
+        device       uchar * dst,
+        uint gid [[thread_position_in_grid]]) {
+    uint row = gid;
+    uint turbo3_block = 0u;
+    uint turbo3_begin = 0u;
+    uint turbo3_end = 0u;
+    if (args.mode == 3u) {
+        if ((args.head_dim & 127u) != 0u) {
+            return;
+        }
+        const uint blocks = args.head_dim / 128u;
+        if (blocks == 0u) {
+            return;
+        }
+        if (args.reserved != 0u) {
+            row = gid / blocks;
+            turbo3_block = gid - row * blocks;
+            turbo3_begin = turbo3_block;
+            turbo3_end = turbo3_block + 1u;
+        } else {
+            row = gid;
+            turbo3_begin = 0u;
+            turbo3_end = blocks;
+        }
+    }
+    if (row >= args.n_rows || args.head_dim == 0 || args.n_rot > args.head_dim) {
+        return;
+    }
+
+    const uint n_nope = args.head_dim - args.n_rot;
+    const uint full_end = (n_nope / 128u) * 128u;
+    const uint n_blocks = full_end / 128u;
+
+    device const uchar * src_row = src + ((ulong)args.src_row0 + row) * args.packed_row_bytes;
+    device       uchar * dst_row = dst + ((ulong)args.dst_row0 + row) * args.dst_row_bytes;
+
+    if (args.mode == 5u) {
+        for (uint block = 0; block < n_blocks; block++) {
+            device const uchar * in_block = src_row + (ulong)block * 50ul;
+            const float corrected = float(*((device const half *)in_block));
+            device const uchar * qs = in_block + sizeof(half);
+            device const uchar * signs = qs + 32ul;
+            float v[128];
+
+            for (uint i = 0; i < 32u; i++) {
+                const uchar packed = qs[i];
+                const uchar sb = signs[i >> 1u];
+                const uint sshift = (i & 1u) * 4u;
+                v[i * 4u + 0u] = dsv4_turbo3_centroids[((uint)packed & 0x03u) |
+                    ((((uint)sb >> (sshift + 0u)) & 0x01u) << 2u)] * corrected;
+                v[i * 4u + 1u] = dsv4_turbo3_centroids[(((uint)packed >> 2u) & 0x03u) |
+                    ((((uint)sb >> (sshift + 1u)) & 0x01u) << 2u)] * corrected;
+                v[i * 4u + 2u] = dsv4_turbo3_centroids[(((uint)packed >> 4u) & 0x03u) |
+                    ((((uint)sb >> (sshift + 2u)) & 0x01u) << 2u)] * corrected;
+                v[i * 4u + 3u] = dsv4_turbo3_centroids[(((uint)packed >> 6u) & 0x03u) |
+                    ((((uint)sb >> (sshift + 3u)) & 0x01u) << 2u)] * corrected;
+            }
+
+            dsv4_turbo_rht_128_inverse(v);
+
+            const uint off = block * 128u;
+            for (uint i = 0; i < 128u; i++) {
+                *((device float *)(dst_row + (off + i) * sizeof(float))) = v[i];
+            }
+        }
+
+        device const uchar * tail = src_row + (ulong)n_blocks * 50ul;
+        for (uint i = full_end; i < args.head_dim; i++) {
+            *((device float *)(dst_row + (ulong)i * sizeof(float))) =
+                *((device const float *)(tail + (ulong)(i - full_end) * sizeof(float)));
+        }
+        return;
+    }
+
+    if (args.mode == 3u) {
+        for (uint block = turbo3_begin; block < turbo3_end; block++) {
+        device const uchar * in_block = src_row + (ulong)block * 50ul;
+        const float corrected = float(*((device const half *)in_block));
+        device const uchar * qs = in_block + sizeof(half);
+        device const uchar * signs = qs + 32ul;
+        float v[128];
+
+        for (uint i = 0; i < 32u; i++) {
+            const uchar packed = qs[i];
+            const uchar sb = signs[i >> 1u];
+            const uint sshift = (i & 1u) * 4u;
+            v[i * 4u + 0u] = dsv4_turbo3_centroids[((uint)packed & 0x03u) |
+                ((((uint)sb >> (sshift + 0u)) & 0x01u) << 2u)] * corrected;
+            v[i * 4u + 1u] = dsv4_turbo3_centroids[(((uint)packed >> 2u) & 0x03u) |
+                ((((uint)sb >> (sshift + 1u)) & 0x01u) << 2u)] * corrected;
+            v[i * 4u + 2u] = dsv4_turbo3_centroids[(((uint)packed >> 4u) & 0x03u) |
+                ((((uint)sb >> (sshift + 2u)) & 0x01u) << 2u)] * corrected;
+            v[i * 4u + 3u] = dsv4_turbo3_centroids[(((uint)packed >> 6u) & 0x03u) |
+                ((((uint)sb >> (sshift + 3u)) & 0x01u) << 2u)] * corrected;
+        }
+
+        dsv4_turbo_rht_128_inverse(v);
+
+        const uint off = block * 128u;
+        for (uint i = 0; i < 128u; i++) {
+            *((device float *)(dst_row + (off + i) * sizeof(float))) = v[i];
+        }
+        }
+        return;
+    }
+
+    for (uint block = 0; block < n_blocks; block++) {
+        device const uchar * in_block = src_row + (ulong)block * 68ul;
+        const float corrected = *((device const float *)in_block);
+        device const uchar * qs = in_block + sizeof(float);
+        float v[128];
+
+        for (uint i = 0; i < 64u; i++) {
+            const uchar packed = qs[i];
+            v[i * 2u] = dsv4_turbo4_fake_centroids[packed & 0x0f] * corrected;
+            v[i * 2u + 1u] = dsv4_turbo4_fake_centroids[(packed >> 4) & 0x0f] * corrected;
+        }
+
+        // The normalized Hadamard transform is its own inverse, so applying it
+        // here returns the packed vector to the domain expected by existing
+        // attention kernels.
+        dsv4_turbo_fwht_128(v);
+
+        const uint off = block * 128u;
+        for (uint i = 0; i < 128u; i++) {
+            *((device float *)(dst_row + (off + i) * sizeof(float))) = v[i];
+        }
+    }
+
+    device const uchar * tail = src_row + (ulong)n_blocks * 68ul;
+    for (uint i = full_end; i < args.head_dim; i++) {
+        *((device float *)(dst_row + (ulong)i * sizeof(float))) =
+            *((device const float *)(tail + (ulong)(i - full_end) * sizeof(float)));
+    }
+}
+
+kernel void kernel_dsv4_turbo4_fake_quantize_f32(
+        constant ds4_metal_args_dsv4_fp8_kv_quantize & args,
+        device  const char * src0,
+        device        char * dst,
+        uint row [[thread_position_in_grid]]) {
+    const int64_t n_rows = args.ne01 * args.ne02 * args.ne03;
+    if ((int64_t)row >= n_rows) {
+        return;
+    }
+
+    const int64_t i1 = row % args.ne01;
+    const int64_t i2 = (row / args.ne01) % args.ne02;
+    const int64_t i3 = row / (args.ne01 * args.ne02);
+
+    device const char * src_base = src0 + i1 * args.nb01 + i2 * args.nb02 + i3 * args.nb03;
+    device       char * dst_base = dst  + i1 * args.nb1  + i2 * args.nb2  + i3 * args.nb3;
+
+    const int64_t n_nope = args.ne00 - args.n_rot;
+    const int64_t full_end = (n_nope / 128) * 128;
+
+    for (int64_t off = 0; off < full_end; off += 128) {
+        float norm_sq = 0.0f;
+        float v[128];
+
+        for (uint i = 0; i < 128; i++) {
+            float x = *((device const float *)(src_base + (off + i) * args.nb00));
+            v[i] = x;
+            norm_sq += x * x;
+        }
+
+        float norm = sqrt(norm_sq);
+        float inv_norm = norm > 1.0e-10f ? 1.0f / norm : 0.0f;
+
+        for (uint i = 0; i < 128; i++) {
+            v[i] *= inv_norm;
+        }
+
+        dsv4_turbo_fwht_128(v);
+
+        float recon_sq = 0.0f;
+        for (uint i = 0; i < 128; i++) {
+            v[i] = dsv4_turbo4_fake_centroid(v[i]);
+            recon_sq += v[i] * v[i];
+        }
+
+        float recon_norm = sqrt(recon_sq);
+        float corrected = recon_norm > 1.0e-10f ? norm / recon_norm : norm;
+
+        for (uint i = 0; i < 128; i++) {
+            *((device float *)(dst_base + (off + i) * args.nb0)) = v[i] * corrected;
+        }
+    }
+
+    for (int64_t i = full_end; i < args.ne00; i++) {
+        *((device float *)(dst_base + i * args.nb0)) =
+            *((device const float *)(src_base + i * args.nb00));
+    }
+}
+
 
 // Decode-side KV finalizer after RoPE. The normal RoPE kernel intentionally
 // remains separate because tiny trigonometric codegen changes can flip later

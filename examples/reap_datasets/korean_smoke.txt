@@ -1,4 +1,0 @@
-===== DS4_IMATRIX_PROMPT 1 =====
-사용자: 한국어로 짧게 답해줘. 딥시크 모델에서 MoE expert pruning을 할 때 어떤 점을 조심해야 해?
-어시스턴트:
-

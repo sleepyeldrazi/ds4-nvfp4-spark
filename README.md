@@ -143,3 +143,8 @@ cd /path/to/reap-for-ds4
 
 The DS4 repo should stay focused on loading and running the resulting compact
 GGUF.
+
+## Acknowledgements
+
+Thanks to [antirez/ds4](https://github.com/antirez/ds4) for the original DS4
+DeepSeek-V4-Flash inference engine that this fork is based on.

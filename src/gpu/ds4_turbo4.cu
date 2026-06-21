@@ -69,7 +69,7 @@ __global__ static void turbo4_pack_kernel(
     uint8_t *rot_out = scale_out + n_blocks + 1;  /* +1: skip padding byte for BF16 alignment */
 
     /* Pack non-RoPE dims: per-64-block e4m3 with e8m0 scale */
-    __shared__ float s_amax[32];
+    __shared__ float s_amax[64];
     for (uint32_t blk = 0; blk < n_blocks; blk++) {
         uint32_t base = blk * TURBO4_BLOCK;
         /* compute block amax */
@@ -78,9 +78,9 @@ __global__ static void turbo4_pack_kernel(
             float v = fabsf(sr[base + i]);
             if (v > amax) amax = v;
         }
-        if (tid < 32) s_amax[tid] = amax;
+        s_amax[tid] = amax;
         __syncthreads();
-        for (uint32_t s = 16; s > 0; s >>= 1) {
+        for (uint32_t s = 32; s > 0; s >>= 1) {
             if (tid < s) { float o = s_amax[tid + s]; if (o > s_amax[tid]) s_amax[tid] = o; }
             __syncthreads();
         }

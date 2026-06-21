@@ -166,4 +166,115 @@ uint32_t ds4_layer_compress_ratio(uint32_t il);
  * ds4_threads_init(); also safe to call directly before first CPU dequant. */
 void ds4_quant_init(void);
 
+/* ---- GGUF loading + model accessors (ds4_gguf.c) ------------------------ */
+
+#define DS4_MAX_DIMS   8
+#define DS4_GGUF_MAGIC 0x46554747u /* "GGUF", little endian. */
+
+typedef struct {
+    const char *name;
+    uint32_t block_elems;
+    uint32_t block_bytes;
+} gguf_type_info;
+
+enum {
+    GGUF_VALUE_UINT8   = 0,
+    GGUF_VALUE_INT8    = 1,
+    GGUF_VALUE_UINT16  = 2,
+    GGUF_VALUE_INT16   = 3,
+    GGUF_VALUE_UINT32  = 4,
+    GGUF_VALUE_INT32   = 5,
+    GGUF_VALUE_FLOAT32 = 6,
+    GGUF_VALUE_BOOL    = 7,
+    GGUF_VALUE_STRING  = 8,
+    GGUF_VALUE_ARRAY   = 9,
+    GGUF_VALUE_UINT64  = 10,
+    GGUF_VALUE_INT64   = 11,
+    GGUF_VALUE_FLOAT64 = 12,
+};
+
+/* DS4 tensor dtype ids (subset of the GGUF type ids this engine reads). */
+enum {
+    DS4_TENSOR_F32      = 0,
+    DS4_TENSOR_F16      = 1,
+    DS4_TENSOR_Q8_0     = 8,
+    DS4_TENSOR_Q2_K     = 10,
+    DS4_TENSOR_Q4_K     = 12,
+    DS4_TENSOR_IQ2_XXS  = 16,
+    DS4_TENSOR_I32      = 26,
+    DS4_TENSOR_NVFP4    = 31,
+};
+
+typedef struct {
+    ds4_str key;
+    uint32_t type;
+    uint64_t value_pos;
+} ds4_kv;
+
+typedef struct {
+    ds4_str name;
+    uint32_t ndim;
+    uint64_t dim[DS4_MAX_DIMS];
+    uint32_t type;
+    uint64_t rel_offset;
+    uint64_t abs_offset;
+    uint64_t elements;
+    uint64_t bytes;
+    /* Per-expert scale_2 array for NVFP4 expert weights (NULL otherwise). */
+    const float *nvfp4_scale_2;
+} ds4_tensor;
+
+typedef struct {
+    int fd;
+    const uint8_t *map;
+    uint64_t size;
+    int managed;  /* 1 if map is a cudaMallocManaged buffer (single-residency path) */
+    uint32_t version;
+    uint64_t n_kv;
+    uint64_t n_tensors;
+    uint64_t alignment;
+    uint64_t tensor_data_pos;
+    ds4_kv *kv;
+    ds4_tensor *tensors;
+} ds4_model;
+
+typedef struct {
+    uint32_t type;
+    uint64_t len;
+    uint64_t data_pos;
+} ds4_array_ref;
+
+/* Open + map the GGUF once. graph_mapping keeps a shared file mapping (the GPU
+ * backend maps slices as host buffers); otherwise the mapping is private.
+ * prefetch_cpu touches pages for the CPU path. */
+void model_open(ds4_model *m, const char *path, bool graph_mapping, bool prefetch_cpu);
+void model_close(ds4_model *m);
+void model_prefetch_cpu_mapping(const ds4_model *m);
+void model_warm_weights(const ds4_model *m);
+void model_summary(const ds4_model *m);
+
+ds4_kv *model_find_kv(const ds4_model *m, const char *key);
+ds4_tensor *model_find_tensor(const ds4_model *m, const char *name);
+bool model_get_string(const ds4_model *m, const char *key, ds4_str *out);
+bool model_get_u32(const ds4_model *m, const char *key, uint32_t *out);
+bool model_get_u64(const ds4_model *m, const char *key, uint64_t *out);
+bool model_get_bool(const ds4_model *m, const char *key, bool *out);
+bool model_get_array(const ds4_model *m, const char *key, ds4_array_ref *out);
+bool model_get_u32_array_exact(const ds4_model *m, const char *key, uint32_t *out, uint64_t expected_len);
+
+const void *tensor_data(const ds4_model *m, const ds4_tensor *t);
+const gguf_type_info *tensor_type(uint32_t type);
+const char *tensor_type_name(uint32_t type);
+bool tensor_nbytes(uint32_t type, uint64_t elements, uint64_t *bytes);
+uint64_t align_up(uint64_t value, uint64_t alignment);
+
+/* Low-level cursor over the mapping.  Exposed for callers that read raw GGUF
+ * metadata fields not covered by the model_get_* accessors (tokenizer
+ * token/merge tables, REAP arrays, steering vectors). */
+ds4_cursor cursor_at(const ds4_model *m, uint64_t pos);
+bool cursor_read(ds4_cursor *c, void *dst, uint64_t n);
+bool cursor_u32(ds4_cursor *c, uint32_t *v);
+bool cursor_u64(ds4_cursor *c, uint64_t *v);
+bool cursor_string(ds4_cursor *c, ds4_str *s);
+
 #endif /* DS4_INTERNAL_H */

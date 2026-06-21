@@ -5,7 +5,7 @@
  *
  * HTTP is intentionally simple: each client connection is handled by a small
  * blocking thread that parses one request, then queues a job to the single
- * Metal worker.  The worker owns the ds4_session and therefore owns all live KV
+ * GPU worker.  The worker owns the ds4_session and therefore owns all live KV
  * cache state.  That keeps session reuse, disk checkpointing, and future
  * batching decisions in one place instead of spreading graph mutations across
  * client threads. */
@@ -5071,7 +5071,7 @@ static void apply_openai_stream_tool_ids(tool_calls *calls,
  * Disk KV Cache.
  * =========================================================================
  *
- * The server has one live Metal session.  We persist reusable DS4 session
+ * The server has one live GPU session.  We persist reusable DS4 session
  * snapshots when a cold prompt reaches a useful prefix, when a long continued
  * conversation has grown far enough, and when a request evicts the live session.
  * The cache key is the SHA1 of the rendered byte prefix.  The payload still
@@ -5113,7 +5113,7 @@ static void apply_openai_stream_tool_ids(tool_calls *calls,
 /* Tokenizers may merge text across the prompt boundary.  Trimming a small tail
  * still improves the cheap token-prefix path, while text-prefix lookup handles
  * the cases where canonical prompt tokenization spells the same bytes
- * differently.  The 2048 alignment also matches the Metal prefill chunk
+ * differently.  The 2048 alignment also matches the GPU prefill chunk
  * schedule, which keeps compressor row finalization identical to a cold full
  * prompt. */
 #define KV_CACHE_DEFAULT_BOUNDARY_TRIM_TOKENS 32
@@ -6960,7 +6960,7 @@ static void generate_job(server *s, job *j) {
     }
     if (cached == 0) s->kv.continued_last_store_tokens = 0;
     if (s->kv.enabled && cached == 0 && old_pos >= s->kv.opt.min_tokens) {
-        /* Loading a disk snapshot replaces the live Metal session.  Persist the
+        /* Loading a disk snapshot replaces the live GPU session.  Persist the
          * current checkpoint first, otherwise a cache hit for an older prefix
          * would silently discard the newer conversation state. */
         kv_cache_store_current(s, "evict");
@@ -7906,8 +7906,8 @@ static void usage(FILE *fp) {
         "      Apply steering after attention outputs. Default: 0\n"
         "  --warm-weights\n"
         "      Touch mapped tensor pages before serving. Slower startup, fewer first-use stalls.\n"
-        "  --metal | --cuda | --cpu | --backend NAME\n"
-        "      Select backend explicitly. Defaults to Metal on macOS and CUDA on CUDA builds.\n"
+        "  --cuda | --cpu | --backend NAME\n"
+        "      Select backend explicitly. Defaults to CUDA on CUDA builds.\n"
         "\n"
         "HTTP API:\n"
         "  --host HOST\n"
@@ -7966,19 +7966,16 @@ static void usage(FILE *fp) {
 }
 
 static ds4_backend parse_backend_arg(const char *s, const char *arg) {
-    if (!strcmp(s, "metal")) return DS4_BACKEND_METAL;
     if (!strcmp(s, "cuda")) return DS4_BACKEND_CUDA;
     if (!strcmp(s, "cpu")) return DS4_BACKEND_CPU;
     server_log(DS4_LOG_DEFAULT, "ds4-server: invalid %s value: %s", arg, s);
-    server_log(DS4_LOG_DEFAULT, "ds4-server: valid server backends are: metal, cuda, cpu");
+    server_log(DS4_LOG_DEFAULT, "ds4-server: valid server backends are: cuda, cpu");
     exit(2);
 }
 
 static ds4_backend default_server_backend(void) {
 #ifdef DS4_NO_GPU
     return DS4_BACKEND_CPU;
-#elif defined(__APPLE__)
-    return DS4_BACKEND_METAL;
 #else
     return DS4_BACKEND_CUDA;
 #endif
@@ -8058,8 +8055,6 @@ static server_config parse_options(int argc, char **argv) {
             directional_steering_scale_set = true;
         } else if (!strcmp(arg, "--warm-weights")) {
             c.engine.warm_weights = true;
-        } else if (!strcmp(arg, "--metal")) {
-            c.engine.backend = DS4_BACKEND_METAL;
         } else if (!strcmp(arg, "--cuda")) {
             c.engine.backend = DS4_BACKEND_CUDA;
         } else if (!strcmp(arg, "--backend")) {

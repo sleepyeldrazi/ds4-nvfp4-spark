@@ -14,8 +14,10 @@
  * ds4_session_sync() reuse, extend, or rebuild the graph state.  Keep this
  * header narrow so HTTP/CLI code does not depend on tensor internals. */
 
+/* GPU compute backend. CUDA is the only supported GPU path; CPU is the
+ * reference/debug backend. (Metal support was removed when the project moved
+ * to the CUDA/Spark path.) */
 typedef enum {
-    DS4_BACKEND_METAL,
     DS4_BACKEND_CUDA,
     DS4_BACKEND_CPU,
 } ds4_backend;
@@ -123,9 +125,9 @@ void ds4_engine_dump_tokens(ds4_engine *e, const ds4_tokens *tokens);
 int ds4_dump_text_tokenization(const char *model_path, const char *text, FILE *fp);
 int ds4_engine_head_test(ds4_engine *e, const ds4_tokens *prompt);
 int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt);
-int ds4_engine_metal_graph_test(ds4_engine *e, const ds4_tokens *prompt);
-int ds4_engine_metal_graph_full_test(ds4_engine *e, const ds4_tokens *prompt);
-int ds4_engine_metal_graph_prompt_test(ds4_engine *e, const ds4_tokens *prompt, int ctx_size);
+int ds4_engine_gpu_graph_test(ds4_engine *e, const ds4_tokens *prompt);
+int ds4_engine_gpu_graph_full_test(ds4_engine *e, const ds4_tokens *prompt);
+int ds4_engine_gpu_graph_prompt_test(ds4_engine *e, const ds4_tokens *prompt, int ctx_size);
 
 void ds4_tokens_push(ds4_tokens *tv, int token);
 void ds4_tokens_free(ds4_tokens *tv);

@@ -49,7 +49,7 @@ int main(int argc, char **argv) {
 
     ds4_engine_options opt = {
         .model_path = model_path,
-        .backend = DS4_BACKEND_METAL,
+        .backend = DS4_BACKEND_CUDA,
         .n_threads = 0,
         .warm_weights = false,
         .quality = false,

@@ -19,11 +19,7 @@ static ds4_engine *test_get_engine(bool quality) {
 
     ds4_engine_options opt = {
         .model_path = test_model_path(),
-#ifdef __APPLE__
-        .backend = DS4_BACKEND_METAL,
-#else
         .backend = DS4_BACKEND_CUDA,
-#endif
         .quality = quality,
     };
     TEST_ASSERT(ds4_engine_open(slot, &opt) == 0);
@@ -72,7 +68,7 @@ static uint16_t test_float_to_f16(float f) {
     return (uint16_t)half;
 }
 
-static void test_metal_f16_matvec_fast_nr0_4(void) {
+static void test_gpu_f16_matvec_fast_nr0_4(void) {
     /*
      * This is the short regression for the long-context repetition failure.
      * Decode uses one-token F16 matvecs for several DS4 projections; the fast
@@ -579,10 +575,10 @@ typedef struct {
 
 static const ds4_test_entry test_entries[] = {
 #ifndef DS4_NO_GPU
-    {"--long-context", "long-context", "long Metal continuation regression", test_long_security_continuation},
+    {"--long-context", "long-context", "long GPU continuation regression", test_long_security_continuation},
     {"--tool-call-quality", "tool-call-quality", "model emits valid DSML tool calls", test_tool_call_quality},
     {"--logprob-vectors", "logprob-vectors", "official API top-logprob vector comparison", test_official_logprob_vectors},
-    {"--metal-kernels", "metal-kernels", "isolated Metal kernel numeric regressions", test_metal_f16_matvec_fast_nr0_4},
+    {"--gpu-kernels", "gpu-kernels", "isolated GPU kernel numeric regressions", test_gpu_f16_matvec_fast_nr0_4},
 #endif
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
 };

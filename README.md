@@ -1,7 +1,7 @@
 # ds4 — NVFP4 hybrid serving on DGX Spark (GB10)
 
 Forked from [antirez/ds4](https://github.com/antirez/ds4), a standalone DeepSeek-V4
-Flash inference engine (C + CUDA/Metal, no GGML dependency). This fork adds **NVFP4
+Flash inference engine (C + CUDA, no GGML dependency). This fork adds **NVFP4
 expert quantization**, a **managed-memory serving path** for GB10 unified memory,
 the **lossless MXFP4→NVFP4 GGUF emission** pipeline, and an **FP8-packed KV cache**.
 

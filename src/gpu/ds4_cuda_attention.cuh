@@ -1134,7 +1134,9 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
     __shared__ uint32_t raw_rows[256];
     __shared__ uint32_t raw_count_s;
     __shared__ uint32_t raw_first_idx_s;
-    __shared__ float4 kv_shared[4 * 128];
+    __shared__ float4 kv_shared[2][4 * 128];   /* double-buffer for cp.async */
+    const uint32_t tid = threadIdx.x;
+    const uint32_t ntid = blockDim.x;
 
     const uint32_t qpos = pos0 + t;
     const uint32_t first_raw_pos = pos0 + n_tokens - n_raw;
@@ -1196,21 +1198,47 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
     float4 o0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     float4 o1 = o0, o2 = o0, o3 = o0;
 
-    for (uint32_t row0 = 0; row0 < n_score; row0 += 4u) {
-        const uint32_t nr = n_score - row0 < 4u ? n_score - row0 : 4u;
-        for (uint32_t off = threadIdx.x; off < nr * 128u; off += blockDim.x) {
+    /* Double-buffered cp.async KV load: tile N+1 loads while tile N computes.
+     * Gather is at row granularity; each row chunk is contiguous float4. */
+    const uint32_t tiles = (n_score + 3u) / 4u;
+    auto issue_tile = [&](uint32_t stage, uint32_t row0, uint32_t nr) {
+        for (uint32_t off = tid; off < nr * 128u; off += ntid) {
             const uint32_t rr = off >> 7u;
             const uint32_t c4 = off & 127u;
             const uint32_t sr = row0 + rr;
             const float4 *src = sr < raw_count
                 ? (const float4 *)(raw_kv + (uint64_t)raw_rows[sr] * head_dim)
                 : (const float4 *)(comp_kv + (uint64_t)(sr - raw_count) * head_dim);
-            kv_shared[off] = src[c4];
+            __pipeline_memcpy_async(&kv_shared[stage][off], &src[c4], 16);
         }
+    };
+
+    uint32_t stage = 0u;
+    if (tiles > 0u) {
+        issue_tile(0u, 0u, n_score < 4u ? n_score : 4u);
+    }
+    __pipeline_commit();
+
+    for (uint32_t ti = 0u; ti < tiles; ti++) {
+        const uint32_t row0 = ti * 4u;
+        const uint32_t nr = n_score - row0 < 4u ? n_score - row0 : 4u;
+
+        /* Issue next tile into the other stage while we compute this one. */
+        if (ti + 1u < tiles) {
+            const uint32_t next_row0 = row0 + 4u;
+            const uint32_t next_nr = n_score - next_row0 < 4u ? n_score - next_row0 : 4u;
+            issue_tile(stage ^ 1u, next_row0, next_nr);
+        }
+        __pipeline_commit();
+
+        /* Current tile's group is now the oldest in flight (prior <= 1). */
+        __pipeline_wait_prior(1);
         __syncthreads();
+
         if (valid_head) {
+            float4 *kvbase = kv_shared[stage];
             for (uint32_t rr = 0; rr < nr; rr++) {
-                const float4 *kv4 = kv_shared + rr * 128u;
+                const float4 *kv4 = kvbase + rr * 128u;
                 float4 k0 = kv4[lane +  0u];
                 float4 k1 = kv4[lane + 32u];
                 float4 k2 = kv4[lane + 64u];
@@ -1245,7 +1273,7 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
                 max_s = new_m;
             }
         }
-        __syncthreads();
+        stage ^= 1u;
     }
 
     if (valid_head) {

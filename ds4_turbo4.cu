@@ -8,8 +8,13 @@
  *   - RoPE dims (n_rot): BF16, 2 bytes each (kept at full precision per the paper)
  *
  * Packed row layout (packv4):
- *   [ n_nope e4m3 bytes | (n_nope/64) e8m0 scale bytes | n_rot BF16 values ]
- *   = 448 + 7 + 128 = 583 bytes per row (vs 2048 FP32) = 3.5x compression.
+ *   [ n_nope e4m3 bytes | (n_nope/64) e8m0 scale bytes | 1 pad byte | n_rot BF16 values ]
+ *   = 448 + 7 + 1 + 128 = 584 bytes per row (vs 2048 FP32) = 3.5x compression.
+ *
+ * The 1-byte padding ensures the BF16 section starts at an even byte offset.
+ * Without it, rot offset = 448+7 = 455 (odd), causing misaligned __nv_bfloat16
+ * loads that crash on GB10 (sm_121a). With padding, rot offset = 456 (even).
+ * The 584-byte row stride is already 8-byte aligned (584 = 73×8).
  *
  * Uses CUDA 13's native cuda_fp8.h types (__nv_fp8_e4m3, __nv_fp8_e8m0) for
  * guaranteed-correct, hardware-accelerated FP8 conversion — no hand-rolled
@@ -30,15 +35,22 @@
 /* ---- format constants ---- */
 #define TURBO4_BLOCK 64  /* e4m3 block size for per-block scaling */
 
-/* Packed row: n_nope e4m3 bytes + (n_nope/64) e8m0 scale bytes + n_rot bf16 (2 bytes) */
+/* Packed row layout:
+ *   [ n_nope e4m3 bytes | (n_nope/64) e8m0 scale bytes | 1 padding byte | n_rot BF16 values ]
+ *   = 448 + 7 + 1 + 128 = 584 bytes per row (vs 2048 FP32) = 3.5x compression.
+ *
+ * The 1-byte padding ensures the BF16 rot section starts at an even offset within
+ * each row. Since row stride (584) is 8-byte aligned, and 448+7+1=456 is even,
+ * every __nv_bfloat16 load in the rot section is 2-byte aligned — required on GB10
+ * (sm_121a) where misaligned 2-byte loads trigger hardware faults. */
 static uint64_t turbo4_row_bytes(uint32_t head_dim, uint32_t n_rot) {
     uint32_t n_nope = head_dim - n_rot;
     uint32_t n_blocks = (n_nope + TURBO4_BLOCK - 1) / TURBO4_BLOCK;
     uint64_t nope_bytes = n_nope;                /* 1 byte per e4m3 */
     uint64_t scale_bytes = n_blocks;             /* 1 e8m0 scale per 64-elem block */
-    uint64_t rot_bytes = (uint64_t)n_rot * 2;    /* BF16 */
-    uint64_t total = nope_bytes + scale_bytes + rot_bytes;
-    /* align to 8 bytes for clean GPU addressing */
+    uint64_t rot_bytes = (uint64_t)n_rot * 2;    /* BF16, 2 bytes each */
+    uint64_t total = nope_bytes + scale_bytes + 1 + rot_bytes;  /* +1 padding byte */
+    /* align to 8 bytes for clean GPU addressing (584 already divisible by 8) */
     return (total + 7ull) & ~7ull;
 }
 
@@ -60,7 +72,7 @@ __global__ static void turbo4_pack_kernel(
     uint8_t *dr = dst + (uint64_t)row * turbo4_row_bytes(head_dim, n_rot);
     uint8_t *nope_out = dr;
     uint8_t *scale_out = dr + n_nope;
-    uint8_t *rot_out = scale_out + n_blocks;
+    uint8_t *rot_out = scale_out + n_blocks + 1;  /* +1: skip padding byte for BF16 alignment */
 
     /* Pack non-RoPE dims: per-64-block e4m3 with e8m0 scale */
     __shared__ float s_amax[32];
@@ -96,11 +108,14 @@ __global__ static void turbo4_pack_kernel(
         __syncthreads();
     }
 
-    /* Pack RoPE dims as BF16 (thread per element) */
+    /* Pack RoPE dims as BF16 (thread per element).
+     * Store via uint16_t pointer — on sm_121a, extracting individual bytes
+     * from __bfloat16_as_ushort() produces incorrect values due to a compiler
+     * lowering bug. Direct uint16_t store through a cast pointer works correctly. */
     for (uint32_t i = tid; i < n_rot; i += blockDim.x) {
-        __nv_bfloat16 bf16 = __float2bfloat16(sr[n_nope + i]);
-        uint16_t raw = *reinterpret_cast<uint16_t *>(&bf16);
-        memcpy(rot_out + (uint64_t)i * 2, &raw, 2);
+        __nv_bfloat16 bf = __float2bfloat16(sr[n_nope + i]);
+        uint16_t *p = (uint16_t *)(rot_out + (uint64_t)i * 2);
+        p[0] = __bfloat16_as_ushort(bf);
     }
 }
 
@@ -121,7 +136,7 @@ __global__ static void turbo4_unpack_kernel(
     const uint8_t *sr = src + (uint64_t)row * turbo4_row_bytes(head_dim, n_rot);
     const uint8_t *nope_in = sr;
     const uint8_t *scale_in = sr + n_nope;
-    const uint8_t *rot_in = scale_in + n_blocks;
+    const uint8_t *rot_in = scale_in + n_blocks + 1;  /* +1: skip padding byte for BF16 alignment */
 
     for (uint32_t blk = 0; blk < n_blocks; blk++) {
         uint32_t base = blk * TURBO4_BLOCK;
@@ -136,10 +151,8 @@ __global__ static void turbo4_unpack_kernel(
         __syncthreads();
     }
     for (uint32_t i = tid; i < n_rot; i += blockDim.x) {
-        uint16_t raw;
-        memcpy(&raw, rot_in + (uint64_t)i * 2, 2);
-        __nv_bfloat16 bf16 = *reinterpret_cast<__nv_bfloat16 *>(&raw);
-        dr[n_nope + i] = __bfloat162float(bf16);
+        uint16_t raw = ((const uint16_t *)rot_in)[(uint64_t)i];
+        dr[n_nope + i] = __bfloat162float(__ushort_as_bfloat16(raw));
     }
 }
 
@@ -161,11 +174,9 @@ __device__ static float turbo4_packed_elem(
         __nv_fp8_e4m3 q = *reinterpret_cast<__nv_fp8_e4m3 *>(&q_byte);
         return (float)q * sv;
     } else {
-        const uint8_t *rot = row_ptr + n_nope + n_blocks;
-        uint16_t raw;
-        memcpy(&raw, rot + (uint64_t)(dim - n_nope) * 2, 2);
-        __nv_bfloat16 bf16 = *reinterpret_cast<__nv_bfloat16 *>(&raw);
-        return __bfloat162float(bf16);
+        const uint8_t *rot = row_ptr + n_nope + n_blocks + 1;  /* +1: skip padding byte */
+        uint16_t raw = ((const uint16_t *)rot)[(uint64_t)(dim - n_nope)];
+        return __bfloat162float(__ushort_as_bfloat16(raw));
     }
 }
 

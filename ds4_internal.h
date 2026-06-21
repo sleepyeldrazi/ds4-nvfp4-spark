@@ -7,18 +7,12 @@
  *
  * The public engine boundary lives in ds4.h (engine + session + token API).
  * This header is the INTERNAL interface used by the engine's own translation
- * units (ds4.c, ds4_util.c, and the upcoming feature modules). Frontends
- * (ds4_cli / ds4_server / ds4_bench) must NOT include this header -- they go
- * through ds4.h only.
+ * units (ds4.c, ds4_util.c, ds4_gguf.c, ds4_quant.c, ds4_tokenizer.c, and the
+ * upcoming feature modules). Frontends (ds4_cli / ds4_server / ds4_bench) must
+ * NOT include this header -- they go through ds4.h only.
  *
- * Contents:
- *   - shared constants (DS4_NEG_INF, RMS eps, rope defaults, ...)
- *   - ds4_str / ds4_cursor value types used by the GGUF loader
- *   - memory + death helpers (xmalloc family, ds4_die)
- *   - logging (ds4_log)
- *   - timing (now_sec)
- *   - CPU worker thread pool (ds4_parallel_for)
- *   - model-geometry helper (ds4_layer_compress_ratio)
+ * Type ordering: value types (ds4_str) -> GGUF types (ds4_tensor/ds4_model) ->
+ * weights/vocab -> engine struct. Each layer depends only on the ones above.
  */
 
 #include <stdarg.h>
@@ -214,6 +208,7 @@ float dsv4_e4m3fn_dequant_cpu(float x);
 void dsv4_fp8_kv_quantize_row_inplace_cpu(float *x, uint32_t head_dim, uint32_t n_rot);
 
 /* ---- GGUF loading + model accessors (ds4_gguf.c) ------------------------ */
+
 #define DS4_MAX_DIMS   8
 #define DS4_GGUF_MAGIC 0x46554747u /* "GGUF", little endian. */
 
@@ -322,5 +317,146 @@ bool cursor_read(ds4_cursor *c, void *dst, uint64_t n);
 bool cursor_u32(ds4_cursor *c, uint32_t *v);
 bool cursor_u64(ds4_cursor *c, uint64_t *v);
 bool cursor_string(ds4_cursor *c, ds4_str *s);
+
+/* ---- model weight bindings (shared core types) -------------------------- */
+
+/* Bound tensor pointers into the mmaped GGUF for one transformer layer. */
+typedef struct {
+    ds4_tensor *hc_attn_fn;
+    ds4_tensor *hc_attn_scale;
+    ds4_tensor *hc_attn_base;
+    ds4_tensor *attn_norm;
+    ds4_tensor *attn_q_a;
+    ds4_tensor *attn_q_a_norm;
+    ds4_tensor *attn_q_b;
+    ds4_tensor *attn_kv;
+    ds4_tensor *attn_kv_a_norm;
+    ds4_tensor *attn_sinks;
+    ds4_tensor *attn_output_a;
+    ds4_tensor *attn_output_b;
+    ds4_tensor *attn_compressor_ape;
+    ds4_tensor *attn_compressor_kv;
+    ds4_tensor *attn_compressor_gate;
+    ds4_tensor *attn_compressor_norm;
+    ds4_tensor *indexer_attn_q_b;
+    ds4_tensor *indexer_proj;
+    ds4_tensor *indexer_compressor_ape;
+    ds4_tensor *indexer_compressor_kv;
+    ds4_tensor *indexer_compressor_gate;
+    ds4_tensor *indexer_compressor_norm;
+    ds4_tensor *hc_ffn_fn;
+    ds4_tensor *hc_ffn_scale;
+    ds4_tensor *hc_ffn_base;
+    ds4_tensor *ffn_norm;
+    ds4_tensor *ffn_gate_tid2eid;
+    ds4_tensor *ffn_gate_inp;
+    ds4_tensor *ffn_exp_probs_b;
+    ds4_tensor *ffn_gate_exps;
+    ds4_tensor *ffn_up_exps;
+    ds4_tensor *ffn_down_exps;
+    ds4_tensor *ffn_gate_shexp;
+    ds4_tensor *ffn_up_shexp;
+    ds4_tensor *ffn_down_shexp;
+    uint32_t reap_policy;
+    uint32_t reap_expert_count;
+    uint32_t reap_keep_count;
+    bool reap_moe_disabled;
+} ds4_layer_weights;
+
+typedef struct {
+    ds4_tensor *token_embd;
+    ds4_tensor *output_hc_base;
+    ds4_tensor *output_hc_fn;
+    ds4_tensor *output_hc_scale;
+    ds4_tensor *output_norm;
+    ds4_tensor *output;
+    ds4_layer_weights layer[DS4_N_LAYER];
+    bool reap_compact_layout;
+} ds4_weights;
+
+typedef struct {
+    ds4_tensor *e_proj;
+    ds4_tensor *h_proj;
+    ds4_tensor *enorm;
+    ds4_tensor *hnorm;
+    ds4_tensor *norm;
+    ds4_tensor *hc_head_base;
+    ds4_tensor *hc_head_fn;
+    ds4_tensor *hc_head_scale;
+    ds4_layer_weights block;
+} ds4_mtp_weights;
+
+/* ---- tokenizer vocab (ds4_tokenizer.c) ---------------------------------- */
+
+/* Reasoning-effort max prefix (the --think-max prompt prelude). */
+extern const char DS4_REASONING_EFFORT_MAX_PREFIX[];
+
+/* Open-addressed string -> int hash table (tokenizer token_to_id, merge_rank). */
+typedef struct {
+    ds4_str key;
+    int value;
+    bool used;
+} str_i32_entry;
+
+typedef struct {
+    str_i32_entry *entry;
+    uint64_t cap;
+    uint64_t used;
+} str_i32_table;
+
+typedef struct ds4_vocab {
+    ds4_str *token;
+    int n_vocab;
+    int bos_id;
+    int eos_id;
+    int user_id;
+    int assistant_id;
+    int think_start_id;
+    int think_end_id;
+    int dsml_id;
+    str_i32_table token_to_id;
+    str_i32_table merge_rank;
+} ds4_vocab;
+
+/* GPT-2 byte-level BPE + DS4 chat prompt encoding.  Operate on ds4_vocab* so
+ * the tokenizer is independent of the engine struct.  The public ds4.h
+ * wrappers (ds4_tokenize_text etc.) live in ds4.c and forward e->vocab. */
+
+/* token_vec is an alias for the public ds4_tokens used by the engine's
+ * internal token-building helpers. */
+typedef ds4_tokens token_vec;
+void token_vec_push(token_vec *tv, int token);
+void token_vec_free(token_vec *tv);
+
+void vocab_load(ds4_vocab *vocab, const ds4_model *model);
+void vocab_free(ds4_vocab *vocab);
+void bpe_tokenize_text(const ds4_vocab *vocab, const char *text, ds4_tokens *out);
+void tokenize_rendered_chat_vocab(const ds4_vocab *vocab, const char *text, ds4_tokens *out);
+void encode_chat_prompt(const ds4_vocab *vocab, const char *system,
+                        const char *prompt, ds4_think_mode think_mode, ds4_tokens *out);
+char *vocab_token_text(const ds4_vocab *vocab, int token, size_t *len);
+int vocab_token_eos(const ds4_vocab *vocab);
+void dump_tokens(const ds4_vocab *vocab, const ds4_tokens *tokens);
+void dump_tokens_fp(FILE *fp, const ds4_vocab *vocab, const ds4_tokens *tokens);
+
+/* ---- engine (ds4.c) ----------------------------------------------------- */
+
+struct ds4_engine {
+    ds4_model model;
+    ds4_model mtp_model;
+    ds4_vocab vocab;
+    ds4_weights weights;
+    ds4_mtp_weights mtp_weights;
+    ds4_backend backend;
+    int mtp_draft_tokens;
+    float mtp_margin;
+    char *directional_steering_file;
+    float *directional_steering_dirs;
+    float directional_steering_attn_scale;
+    float directional_steering_ffn_scale;
+    bool quality;
+    bool gpu_ready;
+    bool mtp_ready;
+};
 
 #endif /* DS4_INTERNAL_H */

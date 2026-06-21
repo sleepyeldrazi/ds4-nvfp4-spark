@@ -42,13 +42,16 @@ is the engine's own cross-module interface.
 - `ds4.h`: public engine + session + tokenizer API (the boundary for frontends).
 - `ds4_internal.h`: shared internal API -- model geometry, GGUF types, value
   types, memory/logging/threading/quant/loader declarations.
-- `ds4.c`: the inference core -- weight binding + validation, CPU reference
-  forward, the GPU graph runtime (drives the backend through `ds4_gpu.h`),
-  sessions, sampler, KV/snapshot payload, engine lifecycle, imatrix/REAP.
+- `ds4.c`: the inference core -- CPU reference forward, the GPU graph runtime
+  (drives the backend through `ds4_gpu.h`), sessions, sampler, KV/snapshot
+  payload, engine lifecycle, imatrix/REAP.
 - `ds4_util.c`: leaf utilities (memory, death, logging, timing, strings,
   file I/O, the CPU worker thread pool, model-geometry helper).
 - `ds4_gguf.c`: GGUF loader and in-place tensor accessors (mmap + managed path).
 - `ds4_quant.c`: quant block formats (Q2_K/Q4_K/Q8_K/IQ2_XXS) + CPU dequant/dot.
+- `ds4_tokenizer.c`: GPT-2 byte-level BPE + DS4 chat prompt encoding.
+- `ds4_weights.c`: GGUF → DS4 weight binding, tensor-layout validation,
+  REAP metadata reader.
 - `ds4_cli.c`: command line, linenoise REPL, interactive transcript handling.
 - `ds4_server.c`: OpenAI/Anthropic compatible HTTP API, worker queue, streaming,
   tool-call mapping, disk KV cache policy.

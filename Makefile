@@ -21,8 +21,8 @@ CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$
 # ds4_gpu.h) + ds4_util.o (shared engine utilities). CPU-only reference build
 # links ds4_cpu.o + ds4_util_cpu.o (both compiled with -DDS4_NO_GPU) and skips
 # the backend.
-CORE_OBJS = ds4.o ds4_util.o ds4_gguf.o ds4_quant.o ds4_tokenizer.o ds4_cuda.o
-CPU_CORE_OBJS = ds4_cpu.o ds4_util_cpu.o ds4_gguf_cpu.o ds4_quant_cpu.o ds4_tokenizer_cpu.o
+CORE_OBJS = ds4.o ds4_util.o ds4_gguf.o ds4_quant.o ds4_tokenizer.o ds4_weights.o ds4_cuda.o
+CPU_CORE_OBJS = ds4_cpu.o ds4_util_cpu.o ds4_gguf_cpu.o ds4_quant_cpu.o ds4_tokenizer_cpu.o ds4_weights_cpu.o
 
 .PHONY: all clean test cpu cuda-regression
 
@@ -60,6 +60,9 @@ ds4_quant.o: ds4_quant.c ds4.h ds4_internal.h
 ds4_tokenizer.o: ds4_tokenizer.c ds4.h ds4_internal.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_tokenizer.c
 
+ds4_weights.o: ds4_weights.c ds4.h ds4_internal.h
+	$(CC) $(CFLAGS) -c -o $@ ds4_weights.c
+
 ds4_cli.o: ds4_cli.c ds4.h linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_cli.c
 
@@ -95,6 +98,9 @@ ds4_quant_cpu.o: ds4_quant.c ds4.h ds4_internal.h
 
 ds4_tokenizer_cpu.o: ds4_tokenizer.c ds4.h ds4_internal.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_tokenizer.c
+
+ds4_weights_cpu.o: ds4_weights.c ds4.h ds4_internal.h
+	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_weights.c
 
 ds4_cli_cpu.o: ds4_cli.c ds4.h linenoise.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_cli.c

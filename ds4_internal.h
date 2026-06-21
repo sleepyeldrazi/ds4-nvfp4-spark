@@ -386,6 +386,21 @@ typedef struct {
     ds4_layer_weights block;
 } ds4_mtp_weights;
 
+/* ---- model weight binding + validation (ds4_weights.c) ----------------- */
+
+/* Bind the GGUF tensor directory into the DS4 layer weight pointer tables,
+ * validate the fixed DS-V4-Flash layout, and read REAP metadata.  Called by
+ * engine_open; weights_free releases the REAP keep-count scratch (tensor
+ * pointers themselves are mmap-backed and not owned). */
+void weights_bind(ds4_weights *w, const ds4_model *m);
+void weights_free(ds4_weights *w);
+void mtp_weights_bind(ds4_mtp_weights *w, const ds4_model *m);
+void config_validate_model(const ds4_model *m);
+
+/* Helpers used by the GPU MoE dispatch (not just the weights module). */
+uint32_t layer_stored_expert_count(const ds4_layer_weights *l);
+uint64_t routed_expert_row_bytes(const ds4_tensor *t);
+
 /* ---- tokenizer vocab (ds4_tokenizer.c) ---------------------------------- */
 
 /* Reasoning-effort max prefix (the --think-max prompt prelude). */

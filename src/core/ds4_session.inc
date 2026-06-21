@@ -1348,7 +1348,7 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
                                                     errlen);
         if (rc == 0 && ratio == 4) {
             rc = payload_write_tensor_span(fp,
-                                           g->layer_index_comp_cache[il],
+                                           gpu_graph_index_comp_cache_for_read(g, il, g->layer_n_index_comp[il]),
                                            0,
                                            (uint64_t)g->layer_n_index_comp[il] * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
                                            buf,
@@ -1674,7 +1674,7 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
                                                    errlen);
         if (rc == 0 && ratio == 4) {
             rc = payload_read_tensor_span(fp,
-                                          g->layer_index_comp_cache[il],
+                                          gpu_graph_index_comp_cache_for_write(g, il),
                                           0,
                                           (uint64_t)n_index_comp[il] * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
                                           buf,
@@ -1682,6 +1682,9 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
                                           &remaining,
                                           err,
                                           errlen);
+            if (rc == 0 && g->turbo_packv4) {
+                rc = gpu_graph_pack_index_comp_rows(g, il, 0, n_index_comp[il]) ? 0 : -1;
+            }
             if (rc == 0) rc = payload_read_tensor_span(fp,
                                                        g->layer_index_state_kv[il],
                                                        0,

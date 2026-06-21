@@ -72,6 +72,8 @@ enum {
 #define DS4_MAYBE_UNUSED
 #endif
 
+#define DS4_STATIC_ASSERT(name, cond) typedef char name[(cond) ? 1 : -1]
+
 /* ---- shared numeric constants -------------------------------------------- */
 
 #define DS4_NEG_INF (-1.0e30f)
@@ -166,8 +168,52 @@ uint32_t ds4_layer_compress_ratio(uint32_t il);
  * ds4_threads_init(); also safe to call directly before first CPU dequant. */
 void ds4_quant_init(void);
 
-/* ---- GGUF loading + model accessors (ds4_gguf.c) ------------------------ */
+/* ---- quant block formats + CPU dequant (ds4_quant.c) -------------------- */
 
+#define QK_K 256
+
+typedef struct {
+    uint8_t  scales[QK_K / 16];
+    uint8_t  qs[QK_K / 4];
+    uint16_t d;
+    uint16_t dmin;
+} block_q2_K;
+
+typedef struct {
+    uint16_t d;
+    uint16_t dmin;
+    uint8_t  scales[12];
+    uint8_t  qs[QK_K / 2];
+} block_q4_K;
+
+typedef struct {
+    float   d;
+    int8_t  qs[QK_K];
+    int16_t bsums[QK_K / 16];
+} block_q8_K;
+
+typedef struct {
+    uint16_t d;
+    uint16_t qs[QK_K / 8];
+} block_iq2_xxs;
+
+/* CPU reference quant + dot-product kernels (NEON where available). */
+void ds4_quantize_row_q8_K(const float *x, block_q8_K *y, int64_t k);
+void ds4_vec_dot_q2_K_q8_K(int n, float *s, const block_q2_K *x, const block_q8_K *y);
+void ds4_vec_dot_q4_K_q8_K(int n, float *s, const block_q4_K *x, const block_q8_K *y);
+void ds4_vec_dot_iq2_xxs_pair_q8_K(int n, float *s0, float *s1,
+                                   const block_iq2_xxs *x0, const block_iq2_xxs *x1,
+                                   const block_q8_K *y);
+
+/* Scalar conversions used by the CPU path + GPU diagnostics. */
+float f16_to_f32(uint16_t h);
+uint16_t f32_to_f16(float f);
+void f16_round_inplace_cpu(float *x, uint32_t n);
+float dsv4_e4m3fn_value_cpu(int i);
+float dsv4_e4m3fn_dequant_cpu(float x);
+void dsv4_fp8_kv_quantize_row_inplace_cpu(float *x, uint32_t head_dim, uint32_t n_rot);
+
+/* ---- GGUF loading + model accessors (ds4_gguf.c) ------------------------ */
 #define DS4_MAX_DIMS   8
 #define DS4_GGUF_MAGIC 0x46554747u /* "GGUF", little endian. */
 

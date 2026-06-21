@@ -16,14 +16,7 @@ __global__ static void matmul_f16_kernel(
         sum += __half2float(wr[i]) * xr[i];
     }
 
-    __shared__ float partial[256];
-    partial[threadIdx.x] = sum;
-    __syncthreads();
-    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) out[tok * out_dim + row] = partial[0];
+    if (threadIdx.x == 0) out[tok * out_dim + row] = block_sum_f32(sum);
 }
 
 __global__ static void matmul_f16_serial_kernel(
@@ -139,14 +132,7 @@ __global__ static void matmul_f32_kernel(
         sum += wr[i] * xr[i];
     }
 
-    __shared__ float partial[256];
-    partial[threadIdx.x] = sum;
-    __syncthreads();
-    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) out[tok * out_dim + row] = partial[0];
+    if (threadIdx.x == 0) out[tok * out_dim + row] = block_sum_f32(sum);
 }
 
 __global__ static void repeat_hc_kernel(float *out, const float *row, uint32_t n_embd, uint32_t n_hc) {

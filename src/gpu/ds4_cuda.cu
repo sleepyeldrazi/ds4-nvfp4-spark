@@ -1580,9 +1580,9 @@ extern "C" void ds4_gpu_set_quality(bool quality) {
     }
 }
 
+#include "ds4_cuda_devutil.cuh"
 #include "ds4_cuda_embed.cuh"
 #include "ds4_cuda_matmul.cuh"
-#include "ds4_cuda_devutil.cuh"
 #include "ds4_cuda_q8.cuh"
 #include "ds4_cuda_norm.cuh"
 #include "ds4_cuda_rope.cuh"

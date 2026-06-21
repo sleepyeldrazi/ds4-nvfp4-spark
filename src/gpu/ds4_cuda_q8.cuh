@@ -102,14 +102,7 @@ __global__ static void matmul_q8_0_preq_kernel(
         int dot = dot_i8_block(qs, xqb, bn, use_dp4a);
         acc += __half2float(*scale_h) * xsr[b] * (float)dot;
     }
-    __shared__ float partial[256];
-    partial[threadIdx.x] = acc;
-    __syncthreads();
-    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) out[tok * out_dim + row] = partial[0];
+    if (threadIdx.x == 0) out[tok * out_dim + row] = block_sum_f32(acc);
 }
 
 __global__ static void matmul_q8_0_preq_warp8_kernel(

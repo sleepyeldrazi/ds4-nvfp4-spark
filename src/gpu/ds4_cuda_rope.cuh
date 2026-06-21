@@ -25,14 +25,7 @@ __global__ static void head_rms_norm_rope_tail_kernel(
         float v = xr[i];
         sum += v * v;
     }
-    __shared__ float partial[256];
-    partial[threadIdx.x] = sum;
-    __syncthreads();
-    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
-        __syncthreads();
-    }
-    const float scale = rsqrtf(partial[0] / (float)head_dim + eps);
+    const float scale = rsqrtf(block_sum_f32(sum) / (float)head_dim + eps);
     const uint32_t n_nope = head_dim - n_rot;
     for (uint32_t i = threadIdx.x; i < n_nope; i += blockDim.x) {
         xr[i] *= scale;

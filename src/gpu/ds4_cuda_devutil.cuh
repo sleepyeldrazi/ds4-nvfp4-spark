@@ -1,4 +1,51 @@
 #include <cuda_pipeline_primitives.h>
+#include <cooperative_groups.h>
+#include <cooperative_groups/reduce.h>
+namespace cg = cooperative_groups;
+
+/* Block-wide reduction (sum / max) over a per-thread value using
+ * cooperative_groups. Returns the reduced scalar in every thread.
+ * blockDim.x must be a multiple of 32 and <= 256 (8 warps).
+ * Validated bit-exact against a naive tree reduction in a standalone test. */
+__device__ __forceinline__ static float block_sum_f32(float v) {
+    __shared__ float scratch;
+    auto block = cg::this_thread_block();
+    auto tile  = cg::tiled_partition<32>(block);
+    v = cg::reduce(tile, v, cg::plus<float>());
+    const uint32_t lane = tile.thread_rank();
+    const uint32_t warp = block.thread_rank() / 32u;
+    const uint32_t nwarps = blockDim.x / 32u;
+    __shared__ float warp_sums[8];
+    if (lane == 0u) warp_sums[warp] = v;
+    block.sync();
+    if (warp == 0u) {
+        float w = (lane < nwarps) ? warp_sums[lane] : 0.0f;
+        w = cg::reduce(tile, w, cg::plus<float>());
+        if (lane == 0u) scratch = w;
+    }
+    block.sync();
+    return scratch;
+}
+
+__device__ __forceinline__ static float block_max_f32(float v) {
+    __shared__ float scratch;
+    auto block = cg::this_thread_block();
+    auto tile  = cg::tiled_partition<32>(block);
+    v = cg::reduce(tile, v, cg::greater<float>());
+    const uint32_t lane = tile.thread_rank();
+    const uint32_t warp = block.thread_rank() / 32u;
+    const uint32_t nwarps = blockDim.x / 32u;
+    __shared__ float warp_sums[8];
+    if (lane == 0u) warp_sums[warp] = v;
+    block.sync();
+    if (warp == 0u) {
+        float w = (lane < nwarps) ? warp_sums[lane] : -INFINITY;
+        w = cg::reduce(tile, w, cg::greater<float>());
+        if (lane == 0u) scratch = w;
+    }
+    block.sync();
+    return scratch;
+}
 
 __device__ static float warp_sum_f32(float v) {
     for (int offset = 16; offset > 0; offset >>= 1) {

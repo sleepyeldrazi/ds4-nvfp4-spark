@@ -8,14 +8,8 @@ __global__ static void rms_norm_plain_kernel(float *out, const float *x, uint32_
         float v = xr[i];
         sum += v * v;
     }
-    __shared__ float partial[256];
-    partial[threadIdx.x] = sum;
-    __syncthreads();
-    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
-        __syncthreads();
-    }
-    float scale = rsqrtf(partial[0] / (float)n + eps);
+    float total = block_sum_f32(sum);
+    float scale = rsqrtf(total / (float)n + eps);
     for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
         orow[i] = xr[i] * scale;
     }
@@ -31,14 +25,8 @@ __global__ static void rms_norm_weight_kernel(float *out, const float *x, const 
         float v = xr[i];
         sum += v * v;
     }
-    __shared__ float partial[256];
-    partial[threadIdx.x] = sum;
-    __syncthreads();
-    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
-        __syncthreads();
-    }
-    float scale = rsqrtf(partial[0] / (float)n + eps);
+    const float total = block_sum_f32(sum);
+    const float scale = rsqrtf(total / (float)n + eps);
     for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
         orow[i] = xr[i] * scale * w[i];
     }
@@ -67,14 +55,8 @@ __global__ static void dsv4_qkv_rms_norm_rows_kernel(
         const float v = xr[i];
         sum += v * v;
     }
-    __shared__ float partial[256];
-    partial[threadIdx.x] = sum;
-    __syncthreads();
-    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
-        __syncthreads();
-    }
-    const float scale = rsqrtf(partial[0] / (float)n + eps);
+    const float total = block_sum_f32(sum);
+    const float scale = rsqrtf(total / (float)n + eps);
     for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
         orow[i] = xr[i] * scale * w[i];
     }
@@ -89,13 +71,7 @@ __global__ static void head_rms_norm_kernel(float *x, uint32_t n_tok, uint32_t n
         float v = xr[i];
         sum += v * v;
     }
-    __shared__ float partial[256];
-    partial[threadIdx.x] = sum;
-    __syncthreads();
-    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
-        __syncthreads();
-    }
-    float scale = rsqrtf(partial[0] / (float)head_dim + eps);
+    const float total = block_sum_f32(sum);
+    const float scale = rsqrtf(total / (float)head_dim + eps);
     for (uint32_t i = threadIdx.x; i < head_dim; i += blockDim.x) xr[i] *= scale;
 }

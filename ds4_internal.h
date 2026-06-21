@@ -1,0 +1,169 @@
+#ifndef DS4_INTERNAL_H
+#define DS4_INTERNAL_H
+
+/* =========================================================================
+ * ds4_internal.h - shared internal API across the ds4 engine modules.
+ * =========================================================================
+ *
+ * The public engine boundary lives in ds4.h (engine + session + token API).
+ * This header is the INTERNAL interface used by the engine's own translation
+ * units (ds4.c, ds4_util.c, and the upcoming feature modules). Frontends
+ * (ds4_cli / ds4_server / ds4_bench) must NOT include this header -- they go
+ * through ds4.h only.
+ *
+ * Contents:
+ *   - shared constants (DS4_NEG_INF, RMS eps, rope defaults, ...)
+ *   - ds4_str / ds4_cursor value types used by the GGUF loader
+ *   - memory + death helpers (xmalloc family, ds4_die)
+ *   - logging (ds4_log)
+ *   - timing (now_sec)
+ *   - CPU worker thread pool (ds4_parallel_for)
+ *   - model-geometry helper (ds4_layer_compress_ratio)
+ */
+
+#include <stdarg.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+
+#include "ds4.h"
+
+/* ---- DeepSeek V4 Flash fixed model geometry ----------------------------------
+ *
+ * The engine implements exactly one model layout. These numbers are the
+ * DeepSeek V4 Flash dimensions and are validated against every loaded GGUF;
+ * code throughout uses them as compile-time fixed-size path markers. */
+enum {
+    DS4_N_LAYER            = 43,
+    DS4_N_EMBD             = 4096,
+    DS4_N_VOCAB            = 129280,
+    DS4_N_HEAD             = 64,
+    DS4_N_HEAD_KV          = 1,
+    DS4_N_HEAD_DIM         = 512,
+    DS4_N_VALUE_DIM        = 512,
+    DS4_N_ROT              = 64,
+    DS4_N_OUT_GROUP        = 8,
+    DS4_N_LORA_Q           = 1024,
+    DS4_N_LORA_O           = 1024,
+    DS4_N_EXPERT           = 256,
+    DS4_N_EXPERT_USED      = 6,
+    DS4_N_EXPERT_SHARED    = 1,
+    DS4_N_FF_EXP           = 2048,
+    DS4_N_HASH_LAYER       = 3,
+    DS4_N_SWA              = 128,
+    DS4_N_INDEXER_HEAD     = 64,
+    DS4_N_INDEXER_HEAD_DIM = 128,
+    DS4_N_INDEXER_TOP_K    = 512,
+    DS4_N_HC               = 4,
+    DS4_N_HC_SINKHORN_ITER = 20,
+};
+
+enum {
+    DS4_REAP_POLICY_NONE = 0,
+    DS4_REAP_POLICY_HASH_PRESERVED = 1,
+    DS4_REAP_POLICY_ROUTER_MASK_PRUNED = 2,
+    DS4_REAP_POLICY_MOE_DISABLED = 3,
+};
+
+#if defined(__GNUC__) || defined(__clang__)
+#define DS4_MAYBE_UNUSED __attribute__((unused))
+#else
+#define DS4_MAYBE_UNUSED
+#endif
+
+/* ---- shared numeric constants -------------------------------------------- */
+
+#define DS4_NEG_INF (-1.0e30f)
+#define DS4_POS_INF ( 1.0e30f)
+#define DS4_RMS_EPS ( 1.0e-6f)
+#define DS4_HC_EPS  ( 1.0e-6f)
+#define DS4_EXPERT_WEIGHT_SCALE (1.5f)
+#define DS4_SWIGLU_CLAMP_EXP    (10.0f)
+#define DS4_ROPE_FREQ_BASE      (10000.0f)
+#define DS4_ROPE_SCALE_FACTOR   (16.0f)
+#define DS4_ROPE_YARN_BETA_FAST (32.0f)
+#define DS4_ROPE_YARN_BETA_SLOW (1.0f)
+#define DS4_COMPRESS_ROPE_FREQ_BASE (160000.0f)
+#define DS4_ROPE_ORIG_CTX       UINT64_C(65536)
+
+/* ---- value types --------------------------------------------------------- */
+
+/* Non-NUL-terminated string slice into the GGUF mapping or a caller buffer. */
+typedef struct {
+    const char *ptr;
+    uint64_t len;
+} ds4_str;
+
+/* Sequential read cursor over a mapped region.  Tracks position and records
+ * the first error so parsers can bail without propagating return codes. */
+typedef struct {
+    const uint8_t *base;
+    uint64_t size;
+    uint64_t pos;
+    char error[256];
+} ds4_cursor;
+
+/* ---- memory + death ------------------------------------------------------ */
+
+void ds4_die(const char *msg);
+void ds4_die_errno(const char *what, const char *path);
+
+void *xcalloc(size_t n, size_t size);
+void *xmalloc(size_t size);
+void *xrealloc(void *ptr, size_t size);
+void *xmalloc_zeroed(size_t n, size_t size);
+char *ds4_strdup(const char *s);
+
+/* Allocation guard.  CPU decode is expected to run entirely out of preallocated
+ * scratch; any malloc/calloc/realloc that slips into the token loop is a bug.
+ * Guarded phases call begin/end around the region where allocation is banned. */
+void ds4_alloc_guard_begin(const char *phase);
+void ds4_alloc_guard_end(void);
+
+/* ---- logging + timing ---------------------------------------------------- */
+
+void ds4_log(FILE *fp, ds4_log_type type, const char *fmt, ...);
+bool ds4_log_is_tty(FILE *fp);
+
+double now_sec(void);
+
+/* ---- strings + hashing --------------------------------------------------- */
+
+bool ds4_streq(ds4_str s, const char *z);
+bool ds4_str_eq(ds4_str a, ds4_str b);
+uint64_t hash_bytes(const void *ptr, uint64_t len);
+
+/* ---- small file I/O helpers --------------------------------------------- */
+
+bool write_f32_binary_file(const char *path, const float *data, uint64_t n);
+bool read_f32_binary_file(const char *path, float *data, uint64_t n);
+
+/* ---- CPU worker thread pool --------------------------------------------- */
+
+typedef void (*ds4_parallel_fn)(void *ctx, uint64_t row0, uint64_t row1);
+
+void ds4_threads_init(void);
+void ds4_threads_shutdown(void);
+
+/* Run a row-parallel CPU kernel.  Small jobs and nested calls run inline to
+ * avoid scheduling overhead; large jobs split across the worker pool. */
+void ds4_parallel_for(uint64_t n_rows, ds4_parallel_fn fn, void *ctx);
+void ds4_parallel_for_min_rows(uint64_t n_rows, ds4_parallel_fn fn, void *ctx, uint64_t min_parallel_rows);
+
+/* Override the auto-detected worker count (called from engine open). */
+void ds4_threads_set_requested(uint32_t n);
+
+/* ---- model geometry ------------------------------------------------------ */
+
+/* Attention compression alternates after layer 1: dense early layers, then
+ * ratio-4 layers with an indexer and ratio-128 layers without one. */
+uint32_t ds4_layer_compress_ratio(uint32_t il);
+
+/* ---- quant table lazy init (implemented by the quant module) ------------- */
+
+/* Build the IQ2 signed lookup grids exactly once.  Called automatically by
+ * ds4_threads_init(); also safe to call directly before first CPU dequant. */
+void ds4_quant_init(void);
+
+#endif /* DS4_INTERNAL_H */

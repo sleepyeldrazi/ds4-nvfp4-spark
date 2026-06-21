@@ -725,6 +725,7 @@ static int run_logprob_dump(ds4_engine *engine, const cli_config *cfg, const ds4
 static int run_generation(ds4_engine *engine, const cli_config *cfg) {
     ds4_tokens prompt = {0};
     build_prompt(engine, &cfg->gen, &prompt);
+    fprintf(stderr, "ds4: [DBG] prompt built, len=%d temp=%f\n", prompt.len, (double)cfg->gen.temperature);
 
     int rc = 0;
     if (cfg->gen.metal_graph_test) {
@@ -767,8 +768,10 @@ static int run_generation(ds4_engine *engine, const cli_config *cfg) {
                     ds4_backend_name(cfg->engine.backend));
         }
     } else if (cfg->gen.temperature > 0.0f || ds4_engine_mtp_draft_tokens(engine) > 1) {
+        fprintf(stderr, "ds4: [DBG] taking sampled generation path\n");
         rc = run_sampled_generation(engine, cfg, &prompt);
     } else {
+        fprintf(stderr, "ds4: [DBG] taking argmax generation path\n");
         token_printer printer = {
             .engine = engine,
             .fp = stdout,

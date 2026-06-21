@@ -1,150 +1,95 @@
-# DS4 REAP Runtime
+# ds4 — NVFP4 hybrid serving on DGX Spark (GB10)
 
-This repository is the DS4 runtime fork used to run REAP-pruned
-DeepSeek-V4-Flash GGUF files.
+Forked from [antirez/ds4](https://github.com/antirez/ds4), a standalone DeepSeek-V4
+Flash inference engine (C + CUDA/Metal, no GGML dependency). This fork adds **NVFP4
+expert quantization**, a **managed-memory serving path** for GB10 unified memory,
+and the **lossless MXFP4→NVFP4 GGUF emission** pipeline.
 
-The REAP observation and pruning workflow lives in a separate REAP-side repo,
-for example:
+## What this fork adds
 
-```text
-/path/to/reap-for-ds4
-```
+### NVFP4 expert kernels + serving (verified)
+- **Lossless MXFP4→NVFP4 repack**: the HF source experts are MXFP4 (e2m1 + e8m0
+  per-32). NVFP4 is e2m1 + e4m3 per-16 + per-expert scale_2. The e2m1 nibbles are
+  identical — the conversion is a lossless scale-only transform (no requant, no
+  amax needed for weights). Verified bit-exact via a round-trip test.
+- **ds4_cuda.cu**: `cuda_block_nvfp4` struct, `dev_dot_nvfp4_q8_K_block` (`__dp4a`
+  MMQ, ~140 GB/s on GB10), batched tile8/tile16 rowspan kernels + two n_tokens==1
+  decode kernels, per-expert `scale_2` array threaded through dispatch.
+- **ds4.c**: name-based NVFP4 GGUF loader (`.nvfp4_weight` + `.nvfp4_scale_2`),
+  forces `DS4_TENSOR_NVFP4` (id 31) for dispatch.
+- **gguf-tools/deepseek4-quantize.c**: NVFP4 emission in the HF→GGUF quantizer
+  (one pass: REAP prune + NVFP4 gate/up + Q2_K down + copy-policy for attn/head).
 
-This DS4 repo is responsible for the inference engine side:
+### Managed-memory serving path (`DS4_CUDA_MANAGED_MODEL=1`)
+GB10 has hardware ATS (`PageableMemAccessUsesHostPageTables=1`) — the GPU reads
+CPU-allocated memory directly, coherent, no copy. This fork loads the GGUF into a
+`cudaMallocManaged` buffer (via chunked `pread` + `posix_fadvise DONTNEED`) with
+`cudaMemAdvise(SetReadMostly + SetPreferredLocation=device)` + `cudaMemPrefetchAsync`,
+and gates off the redundant on-demand cudaMemcpy span cache. Result: single
+residency at ~97 GB/s (measured) → **K180 hybrid (98.6 GiB) serves at ~12 t/s,
+correct, ~118 GiB peak** on the 128 GB Spark.
 
-- open original DS4 DeepSeek-V4-Flash GGUF files for observation
-- expose the routed-expert observation hook used by the REAP repo wrapper
-- load compact REAP GGUF files
-- run `ds4-compact-v1` GGUF files through the existing DS4 Metal/CUDA graph path
+### Encode-path bugs fixed (8 total)
+See `cuda_debug/ENCODE_VERIFICATION.md` for the full list. The load-bearing ones:
+e4m3 bit layout (`(E<<3)|M` not `(E<<4)|M`), per-expert (not per-row) k_max,
+interleaved `cuda_block_nvfp4` layout, the 2^8=256 max-scale edge, GGUF header
+`n_tensors` count, loader type-id mismatch.
 
-## What Changed For REAP
-
-The REAP compact GGUF produced by the REAP repo is not a normal uniform DS4
-GGUF.  It stores fewer expert slots in pruned layers and carries explicit REAP
-metadata.
-
-The runtime was changed to understand this metadata:
-
-```text
-reap.enabled
-reap.layout = ds4-compact-v1
-reap.layer.policy
-reap.layer.expert_count
-reap.layer.keep_count
-```
-
-Important engine changes:
-
-- `ds4.c` validates `reap.layout=ds4-compact-v1`.
-- `ds4.c` reports the runtime marker:
-  `REAP runtime metadata enabled: hash_preserved=... router_masked=...`.
-- `layer_stored_expert_count(...)` returns the actual stored expert count for a
-  layer instead of assuming every layer has 256 physical expert slots.
-- Router, hash-routing, and MoE matmul paths use the layer's stored expert count
-  when accessing compact tensors.
-- The loader accepts compact expert tensors whose expert dimension is reduced in
-  layers pruned by REAP.
-- The existing graph execution path is reused.  REAP reduces stored/mapped model
-  memory; it does not change top-k routing, which remains 6.
-
-The engine also has `--reap-observe-*` options because routed-expert activation
-must be collected inside the DS4 runtime that owns the GGUF graph execution.  In
-normal use, call those options through the REAP repo's Python wrapper:
-
-```text
-tools/ds4_observe_gguf.py
-```
-
-## Build
-
-On macOS:
+## Hybrid GGUF build pipeline
 
 ```bash
-cd /path/to/ds4_reap
-make
+# 1. REAP plan (top-K experts/layer by FP4/FP8 REAP score)
+python3 make_reap_plan.py --obs calibration_fp4fp8.obs.json --k 180 --out plan.json
+
+# 2. Build the hybrid GGUF (one pass: prune + quantize + GGUF write)
+cd gguf-tools && make
+./deepseek4-quantize \
+  --hf <HF MXFP4 checkpoint dir> \
+  --template <existing DS4 GGUF (for metadata/tensor order)> \
+  --reap-plan plan.json \
+  --routed-w1 nvfp4 --routed-w3 nvfp4 --routed-w2 q2_K \
+  --out hybrid-K180.gguf
+
+# 3. Serve on the Spark
+DS4_CUDA_MANAGED_MODEL=1 ./ds4 -m hybrid-K180.gguf -p "..." --ctx 8192
 ```
 
-## Run A REAP-Pruned GGUF
+The quant recipe: gate (w1) + up (w3) experts → **NVFP4**, down (w2) experts →
+**Q2_K**, attention/shared/head → **copy from template** (preserves required f16/f32).
+Non-expert tensors use the copy policy (don't force `--attention q8_0` — it
+over-applies to f16-required HC tensors).
 
-Example compact model path:
+## Memory budget on the 128 GB Spark
 
-```text
-/path/to/ds4_reap/gguf/DeepSeek-V4-Flash-REAP50-DS4-compact-IQ2XXS.gguf
-```
+| component | size |
+|---|---|
+| K180 model (cudaMallocManaged) | 105.2 GB (98.6 GiB) |
+| UVM page-tracking overhead (fixed) | ~7 GB |
+| Graph/activation tensors | 2.2 GB |
+| KV cache (varies with ctx) | 0.15 GiB @ 8K → 17.5 GiB @ 1M (FP32) |
+| OS / cuBLAS / other | ~4 GB |
 
-Run:
+At short context: ~118 GB (fits). At 1M context: the KV grows to ~17.5 GiB (FP32
+storage) → ~129 GB (over). **The KV is stored at FP32, not the DS-V4 paper's FP8** —
+the `turbo_packv4` FP8-packed-KV path is stubbed. Implementing FP8 KV storage (the
+paper spec: e4m3 for non-RoPE dims, BF16 for RoPE) reclaims ~13 GiB → K180 under
+120 GB at full 1M context. This is the next step.
 
-```bash
-cd /path/to/ds4_reap
+## GB10 bandwidth hierarchy (measured)
 
-export DS4_REAP50_GGUF="gguf/DeepSeek-V4-Flash-REAP50-DS4-compact-IQ2XXS.gguf"
-
-./ds4 \
-  -m "$DS4_REAP50_GGUF" \
-  --ctx 512 --nothink --temp 0 -n 64 \
-  -p 'are you deepseek?'
-```
-
-Expected marker:
-
-```text
-REAP runtime metadata enabled: hash_preserved=3 router_masked=40 moe_disabled=0 layout=ds4-compact-v1
-```
-
-Do not rely on `./ds4` without `-m` when comparing original vs REAP.  The
-default `ds4flash.gguf` symlink may point to the original model.  Pass `-m`
-explicitly.
-
-## Inspect
-
-```bash
-./ds4 \
-  -m "$DS4_REAP50_GGUF" \
-  --inspect
-```
-
-## Current Local Smoke Result
-
-Original DS4 q2-imatrix GGUF:
-
-```text
-DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf
-```
-
-REAP50 compact output:
-
-```text
-DeepSeek-V4-Flash-REAP50-DS4-compact-IQ2XXS.gguf
-```
-
-Observed local result:
-
-```text
-original mapped model: about 82697.67 MiB
-REAP compact mapped model: about 48097.66 MiB
-original GGUF size: about 80.76 GiB
-REAP compact GGUF size: about 46.98 GiB
-generation smoke: OK
-```
-
-Short-generation token/s can look similar to the original because active top-k
-is still 6.  The expected local win is model size and mapped memory.
-
-## REAP Workflow Location
-
-Use the REAP repo for observe and prune:
-
-```bash
-cd /path/to/reap-for-ds4
-
-.venv/bin/python tools/ds4_observe_gguf.py --help
-.venv/bin/python tools/ds4_prune_gguf.py --help
-```
-
-The DS4 repo should stay focused on loading and running the resulting compact
-GGUF.
+| path | GB/s |
+|---|---|
+| cudaMemcpy device cache (duplicates model) | ~118 |
+| cudaMallocManaged + hints (single residency) | **97** |
+| cudaMallocManaged un-hinted | 68 |
+| malloc + ATS (4 KiB pages) | 36 |
 
 ## Acknowledgements
 
-Thanks to [antirez/ds4](https://github.com/antirez/ds4) for the original DS4
-DeepSeek-V4-Flash inference engine that this fork is based on.
+- Forked from [antirez/ds4](https://github.com/antirez/ds4) by Salvatore Sanfilippo.
+- NVFP4 format follows NVIDIA Model-Optimizer's `NVFP4QTensor`.
+- DS-V4 attention architecture (CSA/HCA) per the DeepSeek-V4 paper.
+
+## License
+
+Same as upstream ds4 (see LICENSE).

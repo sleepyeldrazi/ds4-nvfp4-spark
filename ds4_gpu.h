@@ -37,6 +37,8 @@ int ds4_gpu_synchronize(void);
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
 int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size);
+void *ds4_gpu_managed_alloc(uint64_t size);
+void ds4_gpu_managed_prefetch(const void *p, uint64_t size);
 int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);
 int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label);
 void ds4_gpu_set_quality(bool quality);
@@ -694,6 +696,9 @@ int ds4_gpu_routed_moe_one_tensor(
         const ds4_gpu_tensor *weights,
         uint32_t                n_expert,
         float                   clamp,
+        const float            *gate_scale_2,
+        const float            *up_scale_2,
+        const float            *down_scale_2,
         const ds4_gpu_tensor *x);
 
 int ds4_gpu_routed_moe_batch_tensor(
@@ -721,6 +726,9 @@ int ds4_gpu_routed_moe_batch_tensor(
         const ds4_gpu_tensor *weights,
         uint32_t                n_expert,
         float                   clamp,
+        const float            *gate_scale_2,
+        const float            *up_scale_2,
+        const float            *down_scale_2,
         const ds4_gpu_tensor *x,
         uint32_t                n_tokens,
         bool                   *mid_is_f16);

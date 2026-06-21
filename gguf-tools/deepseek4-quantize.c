@@ -1092,13 +1092,18 @@ static expert_tensor parse_expert_tensor(const char *name) {
     int layer = -1;
     const char *rest = NULL;
     if (gguf_blk_layer_rest(name, &layer, &rest)) {
-        if (strcmp(rest, "ffn_gate_exps.weight") == 0 ||
-            strcmp(rest, "ffn_down_exps.weight") == 0 ||
-            strcmp(rest, "ffn_up_exps.weight") == 0) {
-            e.is_expert = true;
-            e.layer = layer;
-            e.part = strcmp(rest, "ffn_gate_exps.weight") == 0 ? EXP_W1 :
-                     strcmp(rest, "ffn_down_exps.weight") == 0 ? EXP_W2 : EXP_W3;
+        /* Expert tensors are named ffn_{gate,down,up}_exps.<suffix>. The suffix is
+         * .weight for normal quants and .nvfp4_weight for the NVFP4 expert group
+         * (the weight tensor is renamed so the loader can detect the NVFP4 layout).
+         * Both must parse as expert tensors so generate_expert routes them through
+         * generate_one_expert (which builds HF source names directly for NVFP4). */
+        const char *stem = NULL;
+        if (str_ends(rest, ".weight")) stem = rest;
+        else if (str_ends(rest, ".nvfp4_weight")) stem = rest; /* accept; part decided below */
+        if (stem) {
+            if (str_starts(rest, "ffn_gate_exps.")) { e.is_expert = true; e.layer = layer; e.part = EXP_W1; }
+            else if (str_starts(rest, "ffn_down_exps.")) { e.is_expert = true; e.layer = layer; e.part = EXP_W2; }
+            else if (str_starts(rest, "ffn_up_exps.")) { e.is_expert = true; e.layer = layer; e.part = EXP_W3; }
         }
     }
     return e;
@@ -1540,7 +1545,22 @@ typedef struct {
     pthread_mutex_t lock;
 } expert_job;
 
+/* Forward declarations for NVFP4 helpers (defined below). */
+static byte_buf generate_nvfp4_expert(const char *hf_weight_name, const char *hf_scale_name,
+                                       st_db *db, int64_t nrows, int64_t ncols);
+static byte_buf generate_nvfp4_scale2(st_db *db, const char *gguf_name,
+                                       const tensor_meta *tmpl, int n_experts,
+                                       const reap_plan *reap);
+
 static byte_buf generate_zero_expert(const expert_job *j) {
+    /* NVFP4 zero expert: all-zero cuda_block_nvfp4 blocks. */
+    if (j->target == DS4Q_TYPE_NVFP4) {
+        int64_t blocks_per_row = j->ncols / 256;
+        size_t per_row = (size_t)blocks_per_row * 144;  /* 128 nibble + 16 scale per block */
+        size_t total = (size_t)j->nrows * per_row;
+        uint8_t *out = xcalloc(total ? total : 1, 1);
+        return (byte_buf){.data = out, .size = total};
+    }
     const int64_t n = j->nrows * j->ncols;
     float *zeros = xcalloc((size_t)n, sizeof(float));
     byte_buf q = f32_to_type(zeros, n, j->target, j->ncols, NULL);
@@ -1553,6 +1573,22 @@ static void generate_one_expert(expert_job *j, int xid) {
     if (!reap_expert_slot_is_kept(j->reap, j->expert.layer, old_expert)) {
         if (!j->zero_expert || j->zero_expert->size != j->per_expert) die("zero expert cache size mismatch");
         memcpy(j->out->data + (size_t)xid * j->per_expert, j->zero_expert->data, j->zero_expert->size);
+        return;
+    }
+
+    /* NVFP4: lossless MXFP4 → NVFP4 repack. Copy nibbles verbatim,
+     * convert e8m0 → e4m3 scales, compute per-expert scale_2. */
+    if (j->target == DS4Q_TYPE_NVFP4) {
+        char prefix[256];
+        snprintf(prefix, sizeof(prefix), "layers.%d.ffn.experts.%d.%s", j->expert.layer, old_expert, j->wid);
+        char weight_name[320];
+        char scale_name[320];
+        snprintf(weight_name, sizeof(weight_name), "%s.weight", prefix);
+        snprintf(scale_name, sizeof(scale_name), "%s.scale", prefix);
+        byte_buf nv = generate_nvfp4_expert(weight_name, scale_name, j->db, j->nrows, j->ncols);
+        if (nv.size != j->per_expert) die("NVFP4 repack size mismatch");
+        memcpy(j->out->data + (size_t)xid * j->per_expert, nv.data, nv.size);
+        free(nv.data);
         return;
     }
 
@@ -1595,6 +1631,179 @@ static void *expert_worker(void *arg) {
         pthread_mutex_unlock(&j->lock);
     }
     return NULL;
+}
+
+/* =====
+ * NVFP4 emission (lossless MXFP4 → NVFP4 repack).
+ *
+ * Source MXFP4: e2m1 nibbles (uint8 packed 2/byte) + e8m0 scales (uint8, per-32-block).
+ * Target NVFP4: same e2m1 nibbles repacked into cuda_block_nvfp4 (256-elem blocks =
+ * 128 packed bytes + 16 e4m3fn block scales), plus per-expert scale_2 fp32.
+ *
+ * Lossless path: scale_2 = 2^(k_max - 8), per-block e4m3 scale = 2^(k_j - (k_max-8)),
+ * where k_j = e8m0 - 127. The nibbles are copied verbatim.
+ * ===== */
+
+static int64_t nvfp4_kmax_from_e8m0(const uint8_t *e8m0, int64_t n_scales) {
+    /* Find max non-zero exponent k = e8m0[i] - 127. */
+    int64_t k_max = 0;
+    for (int64_t i = 0; i < n_scales; i++) {
+        int64_t k = (int64_t)e8m0[i] - 127;
+        if (e8m0[i] != 0 && k > k_max) k_max = k;
+    }
+    return k_max;
+}
+
+/* Encode a float to e4m3fn. Layout: sign(1,bit7)|exp(4,bits3-6)|mant(3,bits0-2),
+ * bias 7. Normal (exp!=0): (1+mant/8)*2^(exp-7). Subnormal (exp==0): mant*2^-9.
+ * Max finite = 448 (exp15,mant6 = 0x7E); exp15,mant7 (0x7F) = NaN. Round-to-nearest-even.
+ * Verified bit-exact round-trip vs nvfp4_e4m3_to_float for all powers of 2 in [2^-9,2^7]
+ * and idempotent across all 256 finite values (see cuda_debug/e4m3_encoder_verified.c). */
+static uint8_t float_to_e4m3(float f) {
+    if (f == 0.0f) return 0;
+    uint32_t sign = (f < 0.0f) ? 1u : 0u;
+    float af = sign ? -f : f;
+    union { float f; uint32_t u; } u = { .f = af };
+    uint32_t bits = u.u;
+    int e = (int)((bits >> 23) & 0xFF) - 127;   /* unbiased fp32 exponent */
+    uint32_t m23 = bits & 0x7FFFFFu;            /* 23-bit mantissa */
+    if (e < -6) {                               /* e4m3 subnormal range [2^-9,2^-6) */
+        if (e < -9) return (uint8_t)(sign << 7); /* below min subnormal -> 0 */
+        float kf = af * 512.0f;                 /* af in units of 2^-9 */
+        uint32_t k = (uint32_t)(kf + 0.5f);     /* round to nearest */
+        if (k < 1u) return (uint8_t)(sign << 7);
+        if (k > 7u) k = 7u;
+        return (uint8_t)((sign << 7) | (0u << 3) | (k & 0x7u));
+    }
+    uint32_t E = (uint32_t)(e + 7);             /* e4m3 exponent (normal, E in 1..15) */
+    if (E > 15u) return (uint8_t)((sign << 7) | (15u << 3) | 6u); /* e>8 -> clamp to 448 */
+    uint32_t M = m23 >> 20;                     /* top 3 mantissa bits */
+    uint32_t rem = m23 & 0xFFFFFu;              /* remaining 20 bits */
+    uint32_t halfway = 0x80000u;                /* 1<<19 */
+    if (rem > halfway) M += 1u;
+    else if (rem == halfway) M += (M & 1u);     /* round-to-even */
+    if (M > 7u) { M = 0u; E += 1u; }
+    if (E > 15u) return (uint8_t)((sign << 7) | (15u << 3) | 6u);
+    if (E == 15u && M > 6u) M = 6u;             /* E=15: max finite mantissa is 6 (mant7 = NaN) */
+    return (uint8_t)((sign << 7) | (E << 3) | M);
+}
+
+static byte_buf generate_nvfp4_expert(const char *hf_weight_name, const char *hf_scale_name,
+                                       st_db *db, int64_t nrows, int64_t ncols) {
+    /* Read source MXFP4 weight (uint8, shape [nrows, ncols/2]) and e8m0 scale (uint8, [nrows, ncols/32]). */
+    st_value w = db_read(db, hf_weight_name);
+    st_value s = db_read(db, hf_scale_name);
+    if (w.n_dims != 2) die("NVFP4 weight must be 2D");
+    if (s.n_dims != 2) die("NVFP4 scale must be 2D");
+
+    int64_t src_cols_packed = w.shape[1];  /* ncols/2 */
+    int64_t src_scale_cols = s.shape[1];    /* ncols/32 */
+    if ((int64_t)nrows != w.shape[0]) die("NVFP4 weight row mismatch");
+    if ((int64_t)nrows != s.shape[0]) die("NVFP4 scale row mismatch");
+    if (src_cols_packed * 2 != ncols) die("NVFP4 weight col mismatch");
+    if (src_scale_cols * 32 != ncols) die("NVFP4 scale col mismatch");
+
+    /* NVFP4 block: 256 elements = 128 packed nibble bytes + 16 e4m3 scales.
+     * Source: 32 elements per e8m0 block = 16 nibble bytes + 1 e8m0.
+     * Two source blocks (32+32=64 elements) → one NVFP4 block quarter (64/4=16 scales? No.)
+     * 
+     * Source layout per row: ncols/2 nibble bytes, ncols/32 scale bytes.
+     * NVFP4 layout per row: (ncols/256)*128 nibble bytes + (ncols/256)*16 e4m3 scales.
+     *
+     * Each NVFP4 block (256 elems) covers 256/16=16 sub-blocks of 16 elements.
+     * Source has 256/32=8 e8m0 blocks per NVFP4 block.
+     * Each source e8m0 block (32 elems) → 2 NVFP4 sub-blocks (16+16).
+     * So each source e8m0 scale → 2 identical e4m3 scales (lossless, same k).
+     */
+    int64_t nvfp4_blocks_per_row = ncols / 256;
+    size_t nvfp4_row_bytes = (size_t)nvfp4_blocks_per_row * 144;  /* 128 + 16 per block */
+    size_t total_bytes = (size_t)nrows * nvfp4_row_bytes;
+
+    uint8_t *out = xmalloc(total_bytes);
+    memset(out, 0, total_bytes);
+
+    /* Per-expert k_max over the WHOLE scale tensor (all rows x cols). MUST match
+     * generate_nvfp4_scale2, which computes scale_2 = 2^(k_max-8) from the same
+     * global k_max. The lossless identity e4m3(block_scale)*scale_2 == 2^k_j holds
+     * only when the block-scale encode uses this same m = k_max - 8 (NOT per-row). */
+    int64_t k_max = nvfp4_kmax_from_e8m0(s.data, (int64_t)nrows * src_scale_cols);
+    int m = (int)k_max - 8;
+
+    for (int64_t row = 0; row < nrows; row++) {
+        const uint8_t *src_nib = w.data + (size_t)row * (size_t)src_cols_packed;
+        const uint8_t *src_scl = s.data + (size_t)row * (size_t)src_scale_cols;
+        uint8_t *row_base = out + (size_t)row * nvfp4_row_bytes;
+
+        /* cuda_block_nvfp4 is INTERLEAVED per 256-elem block: each 144-byte block is
+         * 128 nibble bytes followed by its own 16 e4m3 scales (NOT all-nibbles-then-
+         * all-scales). Emit one block at a time so the byte layout matches the struct
+         * the ds4 kernels cast to (cuda_block_nvfp4*). */
+        for (int64_t blk = 0; blk < nvfp4_blocks_per_row; blk++) {
+            uint8_t *bn = row_base + (size_t)blk * 144;          /* this block's 128 nibble bytes */
+            uint8_t *bs = bn + 128;                              /* this block's 16 e4m3 scales */
+            memcpy(bn, src_nib + (size_t)blk * 128, 128);        /* e2m1 nibbles copied verbatim */
+            /* 8 source e8m0 scales cover this block (256 elems / 32); each -> 2 sub-blocks. */
+            for (int64_t sb = 0; sb < 8; sb++) {
+                int64_t k = (int64_t)src_scl[blk * 8 + sb] - 127;
+                float scale_val = ldexpf(1.0f, (int)(k - m));
+                uint8_t e4m3 = float_to_e4m3(scale_val);
+                bs[2 * sb + 0] = e4m3;
+                bs[2 * sb + 1] = e4m3;
+            }
+        }
+    }
+
+    st_value_free(&w);
+    st_value_free(&s);
+    return (byte_buf){.data = out, .size = total_bytes};
+}
+
+/* Generate the .nvfp4_scale_2 tensor for an NVFP4 expert group.
+ * Reads source MXFP4 scales for all kept experts, computes per-expert scale_2. */
+static byte_buf generate_nvfp4_scale2(st_db *db, const char *gguf_name,
+                                       const tensor_meta *tmpl, int n_experts,
+                                       const reap_plan *reap) {
+    (void)n_experts; /* derived from tmpl->ne[0] */
+    /* Parse the GGUF name to find the expert group. */
+    /* gguf_name is like "blk.3.ffn_gate_exps.nvfp4_scale_2" */
+    /* We need the base: "blk.3.ffn_gate_exps" → layer=3, projection=gate */
+    expert_tensor e = parse_expert_tensor(gguf_name);
+    if (!e.is_expert) {
+        /* Name might be .nvfp4_scale_2, not .weight — try parsing differently. */
+        int layer = -1;
+        if (sscanf(gguf_name, "blk.%d.", &layer) == 1) {
+            e.is_expert = true;
+            e.layer = layer;
+            if (strstr(gguf_name, "gate")) e.part = EXP_W1;
+            else if (strstr(gguf_name, "up")) e.part = EXP_W3;
+            else e.part = EXP_W2;
+        }
+    }
+    if (!e.is_expert) die("cannot parse NVFP4 scale_2 tensor name");
+
+    int n_out = (int)tmpl->ne[0];  /* n_experts_kept */
+    float *scales = xcalloc((size_t)n_out, sizeof(float));
+
+    for (int xid = 0; xid < n_out; xid++) {
+        int old_expert = reap_compact_old_expert_for_slot(reap, e.layer, xid);
+        if (!reap_expert_slot_is_kept(reap, e.layer, old_expert)) {
+            scales[xid] = 0.0f;  /* pruned expert gets zero scale */
+            continue;
+        }
+        /* Read source e8m0 scale for this expert. */
+        char scale_name[320];
+        snprintf(scale_name, sizeof(scale_name), "layers.%d.ffn.experts.%d.%s.scale",
+                 e.layer, old_expert, expert_part_name(e.part));
+        st_value s = db_read(db, scale_name);
+        if (s.n_dims != 2) die("NVFP4 source scale must be 2D");
+        int64_t n_scales = s.shape[0] * s.shape[1];
+        int64_t k_max = nvfp4_kmax_from_e8m0(s.data, n_scales);
+        int m = (int)k_max - 8;
+        scales[xid] = ldexpf(1.0f, m);
+        st_value_free(&s);
+    }
+
+    return (byte_buf){.data = (uint8_t *)scales, .size = (size_t)n_out * sizeof(float)};
 }
 
 static byte_buf generate_expert(st_db *db, const char *gguf_name, const tensor_meta *tmpl,
@@ -1995,18 +2204,33 @@ static uint64_t fnv1a64_bytes(const uint8_t *data, size_t n) {
     return h;
 }
 
+/* Count how many expert tensors will be NVFP4 (each adds one .nvfp4_scale_2 tensor). */
+static uint64_t count_nvfp4_experts(const gguf_file *tmpl, const quant_policy *policy) {
+    uint64_t count = 0;
+    for (uint64_t i = 0; i < tmpl->n_tensors; i++) {
+        ds4q_type type = policy_type(policy, tmpl->tensors[i].name, &tmpl->tensors[i]);
+        if (type == DS4Q_TYPE_COUNT) type = tmpl->tensors[i].type;
+        if (type == DS4Q_TYPE_NVFP4 && parse_expert_tensor(tmpl->tensors[i].name).is_expert) {
+            count++;
+        }
+    }
+    return count;
+}
+
 static output_context build_output_context(const gguf_file *tmpl, const quant_policy *policy,
                                            const imatrix_store *im, const reap_plan *reap) {
     output_context out = {0};
-    out.n_tensors = tmpl->n_tensors;
+    uint64_t extra_tensors = count_nvfp4_experts(tmpl, policy);
+    out.n_tensors = tmpl->n_tensors + extra_tensors;
     out.n_kv_extra = extra_imatrix_kv_count(im) + extra_reap_kv_count(reap);
     out.alignment = tmpl->alignment;
     out.tensors = xcalloc((size_t)out.n_tensors, sizeof(out.tensors[0]));
     size_t tensor_info = 0;
     size_t off = 0;
-    for (uint64_t i = 0; i < out.n_tensors; i++) {
+    uint64_t dst_idx = 0;
+    for (uint64_t i = 0; i < tmpl->n_tensors; i++) {
         const tensor_meta *src = &tmpl->tensors[i];
-        tensor_meta *dst = &out.tensors[i];
+        tensor_meta *dst = &out.tensors[dst_idx];
         *dst = *src;
         dst->name = src->name;
         ds4q_type type = policy_type(policy, src->name, src);
@@ -2030,6 +2254,42 @@ static output_context build_output_context(const gguf_file *tmpl, const quant_po
         dst->new_offset = off;
         off += ds4q_pad(dst->size, tmpl->alignment);
         tensor_info += gguf_string_size(dst->name) + 4 + (size_t)dst->n_dims * 8 + 4 + 8;
+        dst_idx++;
+
+        /* NVFP4 expert: add a companion .nvfp4_scale_2 tensor.
+         * Rename the weight tensor from .weight to .nvfp4_weight and add the scale_2 entry. */
+        if (type == DS4Q_TYPE_NVFP4 && exp.is_expert) {
+            /* Rename weight tensor from .weight to .nvfp4_weight. */
+            const char *old_name = dst->name;
+            const char *dot = strstr(old_name, ".weight");
+            if (dot) {
+                /* Build new name: prefix + ".nvfp4_weight" */
+                size_t prefix_len = (size_t)(dot - old_name);
+                char new_name[256];
+                snprintf(new_name, sizeof(new_name), "%.*s.nvfp4_weight", (int)prefix_len, old_name);
+                dst->name = xstrdup(new_name);
+                tensor_info += gguf_string_size(dst->name) - gguf_string_size(old_name);
+            }
+            /* Add .nvfp4_scale_2 tensor: 1D array of n_experts fp32. */
+            tensor_meta *sc = &out.tensors[dst_idx];
+            char scale_name[256];
+            if (dot) {
+                size_t prefix_len = (size_t)(dot - old_name);
+                snprintf(scale_name, sizeof(scale_name), "%.*s.nvfp4_scale_2", (int)prefix_len, old_name);
+            } else {
+                snprintf(scale_name, sizeof(scale_name), "%s.nvfp4_scale_2", old_name);
+            }
+            sc->name = xstrdup(scale_name);
+            sc->n_dims = 1;
+            sc->ne[0] = dst->ne[2];  /* n_experts_kept */
+            sc->ne[1] = sc->ne[2] = sc->ne[3] = 1;
+            sc->type = DS4Q_TYPE_F32;
+            sc->size = (size_t)sc->ne[0] * sizeof(float);
+            sc->new_offset = off;
+            off += ds4q_pad(sc->size, tmpl->alignment);
+            tensor_info += gguf_string_size(sc->name) + 4 + 8 + 4 + 8;
+            dst_idx++;
+        }
     }
     out.tensor_bytes = off;
     out.meta_size = 4 + 4 + 8 + 8 + tmpl->kv_raw_len +
@@ -2055,7 +2315,7 @@ static void write_full_gguf(st_db *db, const gguf_file *tmpl, const output_conte
     if (!fp) die_errno("open output", out_path);
     if (fwrite("GGUF", 1, 4, fp) != 4) die("write GGUF magic failed");
     write_u32(fp, tmpl->version);
-    write_u64(fp, tmpl->n_tensors);
+    write_u64(fp, out_ctx->n_tensors);  /* NOT tmpl->n_tensors: NVFP4 emits extra .nvfp4_scale_2 companions */
     write_u64(fp, tmpl->n_kv + out_ctx->n_kv_extra);
     if (fwrite(tmpl->kv_raw, 1, tmpl->kv_raw_len, fp) != tmpl->kv_raw_len) die("write GGUF KV failed");
     write_imatrix_kvs(fp, imatrix);
@@ -2076,7 +2336,13 @@ static void write_full_gguf(st_db *db, const gguf_file *tmpl, const output_conte
     for (uint64_t i = 0; i < out_ctx->n_tensors; i++) {
         const tensor_meta *dst = &out_ctx->tensors[i];
         fprintf(stderr, "[%4" PRIu64 "/%4" PRIu64 "] %s -> %s\n", i + 1, out_ctx->n_tensors, dst->name, ds4q_type_name(dst->type));
-        byte_buf data = generate_tensor(db, dst->name, dst, dst->type, n_experts, n_threads, imatrix, reap);
+        byte_buf data;
+        if (dst->type == DS4Q_TYPE_F32 && strstr(dst->name, ".nvfp4_scale_2")) {
+            /* NVFP4 scale_2 tensor: generate per-expert scale_2 from source MXFP4 e8m0. */
+            data = generate_nvfp4_scale2(db, dst->name, dst, n_experts, reap);
+        } else {
+            data = generate_tensor(db, dst->name, dst, dst->type, n_experts, n_threads, imatrix, reap);
+        }
         size_t expected = dst->size;
         if (data.size != expected) {
             fprintf(stderr, "error: generated size mismatch for %s: got %zu expected %zu\n", dst->name, data.size, expected);

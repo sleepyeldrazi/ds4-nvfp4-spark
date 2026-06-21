@@ -35,6 +35,23 @@ venv/
 *.pth
 *.bin
 
+# Calibration / imatrix datasets (private, large, not source)
+gguf-tools/imatrix/
+gguf-tools/*.dat
+*.imatrix
+*.obs.json
+
+# Private research notes
+RESEARCH_NOTES.md
+*_RESEARCH_NOTES*
+
+# Large test fixtures (public-domain books etc. — re-fetch if needed)
+speed-bench/promessi_sposi.txt
+tests/long_context_security_prompt.txt
+
+# Dir-steering output artifacts
+dir-steering/out/
+
 # macOS/editor
 .AppleDouble
 .LSOverride

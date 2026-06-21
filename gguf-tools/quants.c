@@ -69,7 +69,7 @@ static const ds4q_traits ds4q_type_traits[DS4Q_TYPE_COUNT] = {
     [DS4Q_TYPE_TQ1_0]   = { "tq1_0",   QK_K,  54, false, false },
     [DS4Q_TYPE_TQ2_0]   = { "tq2_0",   QK_K,  66, false, false },
     [DS4Q_TYPE_MXFP4]   = { "mxfp4",      32,  17, false, false },
-    [DS4Q_TYPE_NVFP4]   = { "nvfp4",      64,  36, false, false },
+    [DS4Q_TYPE_NVFP4]   = { "nvfp4", 256, 144, true,  false },
     [DS4Q_TYPE_Q1_0]    = { "q1_0",      128,  18, false, false },
 };
 

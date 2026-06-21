@@ -13195,6 +13195,9 @@ int ds4_gpu_routed_moe_one_tensor(
         const ds4_gpu_tensor *weights,
         uint32_t                n_expert,
         float                   clamp,
+        const float            *gate_scale_2,
+        const float            *up_scale_2,
+        const float            *down_scale_2,
         const ds4_gpu_tensor *x) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!out || !gate || !up || !mid || !x || !model_map || !selected || !weights ||
@@ -13502,6 +13505,9 @@ int ds4_gpu_routed_moe_batch_tensor(
         const ds4_gpu_tensor *weights,
         uint32_t                n_expert,
         float                   clamp,
+        const float            *gate_scale_2,
+        const float            *up_scale_2,
+        const float            *down_scale_2,
         const ds4_gpu_tensor *x,
         uint32_t                n_tokens,
         bool                   *mid_is_f16) {

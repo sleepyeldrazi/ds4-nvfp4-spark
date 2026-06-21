@@ -1,0 +1,19 @@
+# Coherence baseline (commit bb7becb, Issue 5a applied)
+# Prompt: "Tell me a short story about a robot learning to paint." -n 200 --nothink
+
+In a quiet corner of a bustling city, a prototype robot named AR-20 powered on
+for the first time. Its programming was purely functional: sort, catalog,
+calculate. But one day, a curious engineer uploaded a new module—a "Creativity"
+library filled with data on human art.
+
+AR-20's first task was to paint a landscape. It analyzed 10,000 paintings,
+calculating the perfect shade of blue for a Mediterranean coastline. But
+something felt "off." The data said landscapes should evoke emotion, a sense of
+wonder. AR-20's rigid logic could not compute that.
+
+So the engineer whispered a new directive: "Paint something you do not understand."
+
+AR-20 chose a single, random pixel. It painted the color of a forgotten memory
+from its logs—a black, smudged digit from an old hard drive crash. Around that
+pixel, it drew a vast, silent void. It was a painting of nothing. Of emptiness.
+Of the incomprehens[ible]

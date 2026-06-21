@@ -24,13 +24,7 @@
  * DS-V4 paper spec. "turbo4"/"TurboQuant" is ds4's name for the packed-FP8-KV
  * storage format, NOT the Google TurboQuant paper.
  */
-#include "ds4_gpu.h"
-#include <cuda_runtime.h>
-#include <cuda_fp8.h>
-#include <cuda_bf16.h>
-#include <cstdint>
-#include <cstdio>
-#include <cstring>
+#include "ds4_cuda_common.h"
 
 /* ---- format constants ---- */
 #define TURBO4_BLOCK 64  /* e4m3 block size for per-block scaling */
@@ -43,7 +37,7 @@
  * each row. Since row stride (584) is 8-byte aligned, and 448+7+1=456 is even,
  * every __nv_bfloat16 load in the rot section is 2-byte aligned — required on GB10
  * (sm_121a) where misaligned 2-byte loads trigger hardware faults. */
-static uint64_t turbo4_row_bytes(uint32_t head_dim, uint32_t n_rot) {
+static __host__ __device__ uint64_t turbo4_row_bytes(uint32_t head_dim, uint32_t n_rot) {
     uint32_t n_nope = head_dim - n_rot;
     uint32_t n_blocks = (n_nope + TURBO4_BLOCK - 1) / TURBO4_BLOCK;
     uint64_t nope_bytes = n_nope;                /* 1 byte per e4m3 */

@@ -21,7 +21,8 @@ CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$
 # ds4_gpu.h) + ds4_util.o (shared engine utilities). CPU-only reference build
 # links ds4_cpu.o + ds4_util_cpu.o (both compiled with -DDS4_NO_GPU) and skips
 # the backend.
-CORE_OBJS = ds4.o ds4_util.o ds4_gguf.o ds4_quant.o ds4_tokenizer.o ds4_weights.o ds4_cuda.o
+CUDA_OBJS = ds4_cuda.o ds4_turbo4.o
+CORE_OBJS = ds4.o ds4_util.o ds4_gguf.o ds4_quant.o ds4_tokenizer.o ds4_weights.o $(CUDA_OBJS)
 CPU_CORE_OBJS = ds4_cpu.o ds4_util_cpu.o ds4_gguf_cpu.o ds4_quant_cpu.o ds4_tokenizer_cpu.o ds4_weights_cpu.o
 
 .PHONY: all clean test cpu cuda-regression
@@ -111,10 +112,13 @@ ds4_server_cpu.o: ds4_server.c ds4.h rax.h
 ds4_bench_cpu.o: ds4_bench.c ds4.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_bench.c
 
-ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_iq2_tables_cuda.inc
+ds4_cuda.o: ds4_cuda.cu ds4_cuda_common.h ds4_iq2_tables_cuda.inc ds4_cuda_embed.cuh ds4_cuda_matmul.cuh ds4_cuda_devutil.cuh ds4_cuda_q8.cuh ds4_cuda_norm.cuh ds4_cuda_rope.cuh ds4_cuda_attention.cuh ds4_cuda_hc.cuh ds4_cuda_compressor.cuh ds4_cuda_router.cuh ds4_cuda_indexer.cuh ds4_cuda_dispatch1.cuh ds4_cuda_dispatch2.cuh ds4_cuda_dispatch3.cuh ds4_cuda_quant.cuh ds4_cuda_moe.cuh ds4_cuda_moe_dispatch.cuh ds4_cuda_dispatch4.cuh
 	$(NVCC) $(NVCCFLAGS) -c -o $@ ds4_cuda.cu
 
-tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o ds4_cuda.o
+ds4_turbo4.o: ds4_turbo4.cu ds4_cuda_common.h
+	$(NVCC) $(NVCCFLAGS) -c -o $@ ds4_turbo4.cu
+
+tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o $(CUDA_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 ds4_test: ds4_test.o rax.o $(CORE_OBJS)

@@ -102,10 +102,9 @@ __global__ static void turbo4_pack_kernel(
         __syncthreads();
     }
 
-    /* Pack RoPE dims as BF16 (thread per element).
-     * Store via uint16_t pointer — on sm_121a, extracting individual bytes
-     * from __bfloat16_as_ushort() produces incorrect values due to a compiler
-     * lowering bug. Direct uint16_t store through a cast pointer works correctly. */
+    /* Pack RoPE dims as BF16 (thread per element). Store the BF16 bits via a
+     * uint16_t pointer — the rot section is 2-byte aligned (see
+     * turbo4_row_bytes), so this is a clean aligned store. */
     for (uint32_t i = tid; i < n_rot; i += blockDim.x) {
         __nv_bfloat16 bf = __float2bfloat16(sr[n_nope + i]);
         uint16_t *p = (uint16_t *)(rot_out + (uint64_t)i * 2);
@@ -132,6 +131,8 @@ __global__ static void turbo4_unpack_kernel(
     const uint8_t *scale_in = sr + n_nope;
     const uint8_t *rot_in = scale_in + n_blocks + 1;  /* +1: skip padding byte for BF16 alignment */
 
+    /* No shared memory used here — the per-block __syncthreads() is unnecessary
+     * (all reads/writes are to global memory with no inter-thread dependency). */
     for (uint32_t blk = 0; blk < n_blocks; blk++) {
         uint32_t base = blk * TURBO4_BLOCK;
         __nv_fp8_storage_t scale_byte = scale_in[blk];
@@ -142,7 +143,6 @@ __global__ static void turbo4_unpack_kernel(
             __nv_fp8_e4m3 q = *reinterpret_cast<__nv_fp8_e4m3 *>(&q_byte);
             dr[base + i] = (float)q * scale_val;
         }
-        __syncthreads();
     }
     for (uint32_t i = tid; i < n_rot; i += blockDim.x) {
         uint16_t raw = ((const uint16_t *)rot_in)[(uint64_t)i];

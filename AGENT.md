@@ -42,9 +42,13 @@ is the engine's own cross-module interface.
 - `ds4.h`: public engine + session + tokenizer API (the boundary for frontends).
 - `ds4_internal.h`: shared internal API -- model geometry, GGUF types, value
   types, memory/logging/threading/quant/loader declarations.
-- `ds4.c`: the inference core -- CPU reference forward, the GPU graph runtime
-  (drives the backend through `ds4_gpu.h`), sessions, sampler, KV/snapshot
-  payload, engine lifecycle, imatrix/REAP.
+- `ds4.c`: the inference core — CPU reference forward (embed, norms, matvecs,
+  and token-at-a-time decode), the GPU graph runtime (drives the backend
+  through `ds4_gpu.h`), sessions, sampler, KV/snapshot payload, engine
+  lifecycle, imatrix/REAP.  The CPU forward code is intentionally kept here
+  with the session model — the scratch-based helpers and the row-parallel
+  dispatch share enough internal types that extracting them would create an
+  artificial border.
 - `ds4_util.c`: leaf utilities (memory, death, logging, timing, strings,
   file I/O, the CPU worker thread pool, model-geometry helper).
 - `ds4_gguf.c`: GGUF loader and in-place tensor accessors (mmap + managed path).

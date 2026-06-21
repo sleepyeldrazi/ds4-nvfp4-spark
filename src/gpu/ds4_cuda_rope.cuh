@@ -127,29 +127,13 @@ __global__ static void rope_tail_kernel(
     tail[i + 1] = x0 * s + x1 * c;
 }
 
-__device__ static float dsv4_e4m3fn_value_dev(int i) {
-    int exp = (i >> 3) & 15;
-    int mant = i & 7;
-    if (exp == 0) return (float)mant * 0.001953125f;
-    return (1.0f + (float)mant * 0.125f) * exp2f((float)exp - 7.0f);
-}
-
+/* Round-trip a float through FP8 e4m3 (SATFINITE + round-to-nearest-even) using
+ * the CUDA 12.9+ native __nv_fp8_e4m3 type, instead of a hand-rolled binary
+ * search over the e4m3 codebook. Equivalent semantics, one instruction.
+ * Input is assumed already clamped to [-448, 448] by the caller. */
 __device__ static float dsv4_e4m3fn_dequant_dev(float x) {
-    float sign = x < 0.0f ? -1.0f : 1.0f;
-    float ax = fminf(fabsf(x), 448.0f);
-    int lo = 0, hi = 126;
-    while (lo < hi) {
-        int mid = (lo + hi + 1) >> 1;
-        if (dsv4_e4m3fn_value_dev(mid) <= ax) lo = mid;
-        else hi = mid - 1;
-    }
-    int best = lo;
-    if (best < 126) {
-        float bd = fabsf(ax - dsv4_e4m3fn_value_dev(best));
-        float nd = fabsf(ax - dsv4_e4m3fn_value_dev(best + 1));
-        if (nd < bd || (nd == bd && (((best + 1) & 1) == 0) && ((best & 1) != 0))) best++;
-    }
-    return sign * dsv4_e4m3fn_value_dev(best);
+    __nv_fp8_e4m3 q(x);          /* SATFINITE, round-to-nearest-even */
+    return (float)q;
 }
 
 __device__ static float model_scalar_dev(const void *base, uint64_t offset, uint32_t type, uint64_t idx) {

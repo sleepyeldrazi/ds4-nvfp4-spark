@@ -45,7 +45,7 @@ cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o linenoise.o rax.o $(CPU_CORE
 cuda-regression: tests/cuda_long_context_smoke
 	./tests/cuda_long_context_smoke
 
-ds4.o: ds4.c ds4.h ds4_internal.h ds4_gpu.h
+ds4.o: ds4.c ds4.h ds4_internal.h ds4_gpu.h ds4_cpu.inc ds4_gpu.inc ds4_session.inc
 	$(CC) $(CFLAGS) -c -o $@ ds4.c
 
 ds4_util.o: ds4_util.c ds4.h ds4_internal.h
@@ -84,7 +84,7 @@ rax.o: rax.c rax.h rax_malloc.h
 linenoise.o: linenoise.c linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ linenoise.c
 
-ds4_cpu.o: ds4.c ds4.h ds4_internal.h ds4_gpu.h
+ds4_cpu.o: ds4.c ds4.h ds4_internal.h ds4_gpu.h ds4_cpu.inc ds4_gpu.inc ds4_session.inc
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4.c
 
 ds4_util_cpu.o: ds4_util.c ds4.h ds4_internal.h

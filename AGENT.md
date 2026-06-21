@@ -35,34 +35,37 @@ CUDA/Spark path); CUDA kernels implementing `ds4_gpu.h` live in `ds4_cuda.cu`.
 
 ## Layout
 
-The engine is split across several translation units that share an internal
-header. Frontends (CLI/server/bench) go through `ds4.h` only; `ds4_internal.h`
-is the engine's own cross-module interface.
+The engine is split across reusable translation units and included feature
+modules. Frontends (CLI/server/bench) go through `ds4.h` only.
 
-- `ds4.h`: public engine + session + tokenizer API (the boundary for frontends).
-- `ds4_internal.h`: shared internal API -- model geometry, GGUF types, value
-  types, memory/logging/threading/quant/loader declarations.
-- `ds4.c`: the inference core — CPU reference forward (embed, norms, matvecs,
-  and token-at-a-time decode), the GPU graph runtime (drives the backend
-  through `ds4_gpu.h`), sessions, sampler, KV/snapshot payload, engine
-  lifecycle, imatrix/REAP.  The CPU forward code is intentionally kept here
-  with the session model — the scratch-based helpers and the row-parallel
-  dispatch share enough internal types that extracting them would create an
-  artificial border.
-- `ds4_util.c`: leaf utilities (memory, death, logging, timing, strings,
-  file I/O, the CPU worker thread pool, model-geometry helper).
-- `ds4_gguf.c`: GGUF loader and in-place tensor accessors (mmap + managed path).
-- `ds4_quant.c`: quant block formats (Q2_K/Q4_K/Q8_K/IQ2_XXS) + CPU dequant/dot.
-- `ds4_tokenizer.c`: GPT-2 byte-level BPE + DS4 chat prompt encoding.
-- `ds4_weights.c`: GGUF → DS4 weight binding, tensor-layout validation,
-  REAP metadata reader.
-- `ds4_cli.c`: command line, linenoise REPL, interactive transcript handling.
-- `ds4_server.c`: OpenAI/Anthropic compatible HTTP API, worker queue, streaming,
-  tool-call mapping, disk KV cache policy.
-- `ds4_cuda.cu`: CUDA backend implementing the `ds4_gpu.h` tensor/kernel API.
-- `ds4_gpu.h`: backend-agnostic GPU API (tensors + dispatch); the engine drives
-  the backend only through this header.
-- `tests/`: unit and live integration tests.
+### Reusable translation units
+- `ds4.h`: public engine + session + tokenizer API.
+- `ds4_internal.h`: shared internal API — model geometry, GGUF types,
+  inference-core types (cpu_decode_scratch, kv_cache, gpu_graph, session),
+  and declarations for all module entry points.
+- `ds4_util.c`: leaf utilities (memory, logging, thread pool).
+- `ds4_gguf.c`: GGUF loader + in-place tensor accessors.
+- `ds4_quant.c`: quant block formats + CPU dequant/dot kernels.
+- `ds4_tokenizer.c`: GPT-2 BPE + DS4 chat encoding.
+- `ds4_weights.c`: GGUF → DS4 weight binding + layout validation.
+
+### Feature modules (included via #include from ds4.c)
+These preserve the original preprocessor guard structure. Each is a focused
+area that one developer can own independently.
+- `ds4.c` (1999 lines): header + include dispatcher + the pre-CPU setup
+  boilerplate (accelerator cache, process lock, etc.).
+- `ds4_cpu.inc` (3884 lines): CPU reference forward — Hyper-Connection
+  transforms, attention projections (RoPE + compressed-attention indexer),
+  mixture-of-experts FFN, KV cache management.
+- `ds4_gpu.inc` (6409 lines): GPU graph runtime — graph state, decode/prefill
+  dispatch, diagnostic comparisons, imatrix/REAP collection.
+- `ds4_session.inc` (3619 lines): Engine API + process lock + session
+  snapshot payloads (disk KV persistence).
+
+### Frontends + backend
+- `ds4_cli.c` / `ds4_server.c` / `ds4_bench.c`: command-line, HTTP, benchmark.
+- `ds4_cuda.cu`: CUDA backend (ds4_gpu.h implementation).
+- `ds4_gpu.h`: backend-agnostic GPU API.
 
 ## Testing
 

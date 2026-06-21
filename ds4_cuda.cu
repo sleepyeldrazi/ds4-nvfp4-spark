@@ -1,5 +1,7 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
+#include <cuda_bf16.h>
 #include <mma.h>
 #include <cublas_v2.h>
 
@@ -10785,4 +10787,203 @@ extern "C" int ds4_gpu_matmul_q8_0_hc_expand_tensor(
                                         weight_offset, in_dim, out_dim, x, 1) &&
            ds4_gpu_hc_expand_split_tensor(out_hc, block_out, residual_hc,
                                             split, n_embd, n_hc);
+}
+
+/* =========================================================================
+ * FP8-packed compressed KV cache (packv4 format) — the turbo4 implementation.
+ *
+ * Implements the stubbed turbo4 interface with real FP8-density KV storage
+ * matching the DeepSeek-V4 paper:
+ *   - non-RoPE dims (n_nope = head_dim - n_rot): e4m3fn, 1 byte each
+ *   - per-64-element block scale: e8m0 (1 byte, scale = 2^(k-127))
+ *   - RoPE dims (n_rot): BF16, 2 bytes each (full precision per the paper)
+ *
+ * Packed row: [ n_nope e4m3 | (n_nope/64) e8m0 scales | n_rot BF16 ]
+ * = 448 + 7 + 128 = 583 bytes (vs 2048 FP32) = 3.5x compression.
+ *
+ * Uses CUDA 13 native cuda_fp8.h types (__nv_fp8_e4m3, __nv_fp8_e8m0) for
+ * guaranteed-correct, hardware-accelerated FP8 conversion.
+ *
+ * No Hadamard rotation / PolarQuant / QJL — plain FP8 KV per the DS-V4 paper.
+ * "turbo4" is ds4's name for the packed-FP8-KV storage format.
+ * ========================================================================= */
+
+#define TURBO4_BLOCK 64  /* e4m3 block size for per-block scaling */
+
+static __device__ __host__ uint64_t turbo4_row_bytes(uint32_t head_dim, uint32_t n_rot) {
+    uint32_t n_nope = head_dim - n_rot;
+    uint32_t n_blocks = (n_nope + TURBO4_BLOCK - 1) / TURBO4_BLOCK;
+    uint64_t total = (uint64_t)n_nope + n_blocks + (uint64_t)n_rot * 2;
+    return (total + 7ull) & ~7ull;  /* align to 8 for clean GPU addressing */
+}
+
+/* ---- pack kernel: FP32 compressed KV -> packed FP8 ---- */
+__global__ static void turbo4_pack_kernel(
+        uint8_t *dst, const float *src, uint32_t n_rows,
+        uint32_t head_dim, uint32_t n_rot)
+{
+    uint32_t row = blockIdx.x;
+    if (row >= n_rows) return;
+    uint32_t tid = threadIdx.x;
+    uint32_t n_nope = head_dim - n_rot;
+    uint32_t n_blocks = (n_nope + TURBO4_BLOCK - 1) / TURBO4_BLOCK;
+    const float *sr = src + (uint64_t)row * head_dim;
+    uint8_t *dr = dst + (uint64_t)row * turbo4_row_bytes(head_dim, n_rot);
+    uint8_t *nope_out = dr;
+    uint8_t *scale_out = dr + n_nope;
+    uint8_t *rot_out = scale_out + n_blocks;
+
+    __shared__ float s_amax[32];
+    for (uint32_t blk = 0; blk < n_blocks; blk++) {
+        uint32_t base = blk * TURBO4_BLOCK;
+        float amax = 0.0f;
+        for (uint32_t i = tid; i < TURBO4_BLOCK && base + i < n_nope; i += blockDim.x) {
+            float v = fabsf(sr[base + i]);
+            if (v > amax) amax = v;
+        }
+        if (tid < 32) s_amax[tid] = amax;
+        __syncthreads();
+        for (uint32_t s = 16; s > 0; s >>= 1) {
+            if (tid < s) { float o = s_amax[tid + s]; if (o > s_amax[tid]) s_amax[tid] = o; }
+            __syncthreads();
+        }
+        float block_amax = s_amax[0];
+        /* e8m0 scale: round to nearest power of 2 (cudaRoundPosInf, SATFINITE).
+         * __nv_fp8_e8m0(float) does exactly this per the CUDA 13 docs. */
+        __nv_fp8_e8m0 scale_e8m0(block_amax);
+        __nv_fp8_storage_t scale_byte = *reinterpret_cast<__nv_fp8_storage_t *>(&scale_e8m0);
+        if (tid == 0) scale_out[blk] = scale_byte;
+        float scale_val = (float)scale_e8m0;
+        if (scale_val == 0.0f) scale_val = 1.0f;
+        /* quantize: v/scale -> e4m3 (SATFINITE -> clamps to 448, RNE) */
+        for (uint32_t i = tid; i < TURBO4_BLOCK && base + i < n_nope; i += blockDim.x) {
+            float v = sr[base + i] / scale_val;
+            __nv_fp8_e4m3 q(v);
+            nope_out[base + i] = *reinterpret_cast<__nv_fp8_storage_t *>(&q);
+        }
+        __syncthreads();
+    }
+    /* RoPE dims as BF16 */
+    for (uint32_t i = tid; i < n_rot; i += blockDim.x) {
+        __nv_bfloat16 bf16 = __float2bfloat16(sr[n_nope + i]);
+        uint16_t raw = *reinterpret_cast<uint16_t *>(&bf16);
+        memcpy(rot_out + (uint64_t)i * 2, &raw, 2);
+    }
+}
+
+/* ---- unpack kernel: packed FP8 -> FP32 ---- */
+__global__ static void turbo4_unpack_kernel(
+        float *dst, const uint8_t *src, uint32_t n_rows,
+        uint32_t head_dim, uint32_t n_rot)
+{
+    uint32_t row = blockIdx.x;
+    if (row >= n_rows) return;
+    uint32_t tid = threadIdx.x;
+    uint32_t n_nope = head_dim - n_rot;
+    uint32_t n_blocks = (n_nope + TURBO4_BLOCK - 1) / TURBO4_BLOCK;
+    float *dr = dst + (uint64_t)row * head_dim;
+    const uint8_t *sr = src + (uint64_t)row * turbo4_row_bytes(head_dim, n_rot);
+    const uint8_t *nope_in = sr;
+    const uint8_t *scale_in = sr + n_nope;
+    const uint8_t *rot_in = scale_in + n_blocks;
+
+    for (uint32_t blk = 0; blk < n_blocks; blk++) {
+        uint32_t base = blk * TURBO4_BLOCK;
+        __nv_fp8_e8m0 scale_e8m0 = *reinterpret_cast<const __nv_fp8_e8m0 *>(scale_in + blk);
+        float scale_val = (float)scale_e8m0;
+        for (uint32_t i = tid; i < TURBO4_BLOCK && base + i < n_nope; i += blockDim.x) {
+            __nv_fp8_e4m3 q = *reinterpret_cast<const __nv_fp8_e4m3 *>(nope_in + base + i);
+            dr[base + i] = (float)q * scale_val;
+        }
+        __syncthreads();
+    }
+    for (uint32_t i = tid; i < n_rot; i += blockDim.x) {
+        __nv_bfloat16 bf16 = *reinterpret_cast<const __nv_bfloat16 *>(rot_in + (uint64_t)i * 2);
+        dr[n_nope + i] = __bfloat162float(bf16);
+    }
+}
+
+/* ---- device helper: on-the-fly unpack a single element from a packed row ---- */
+__device__ static float turbo4_packed_elem(
+        const uint8_t *row_ptr, uint32_t dim, uint32_t head_dim, uint32_t n_rot)
+{
+    uint32_t n_nope = head_dim - n_rot;
+    uint32_t n_blocks = (n_nope + TURBO4_BLOCK - 1) / TURBO4_BLOCK;
+    if (dim < n_nope) {
+        const uint8_t *nope = row_ptr;
+        const uint8_t *scale = row_ptr + n_nope;
+        uint32_t blk = dim / TURBO4_BLOCK;
+        __nv_fp8_e8m0 sv_e8m0 = *reinterpret_cast<const __nv_fp8_e8m0 *>(scale + blk);
+        float sv = (float)sv_e8m0;
+        __nv_fp8_e4m3 q = *reinterpret_cast<const __nv_fp8_e4m3 *>(nope + dim);
+        return (float)q * sv;
+    } else {
+        const uint8_t *rot = row_ptr + n_nope + n_blocks;
+        __nv_bfloat16 bf16 = *reinterpret_cast<const __nv_bfloat16 *>(rot + (uint64_t)(dim - n_nope) * 2);
+        return __bfloat162float(bf16);
+    }
+}
+
+/* ---- public API (overrides the stubs in ds4_turbo4_stubs.c) ---- */
+/* NOTE: ds4_turbo4_stubs.c is no longer compiled (removed from Makefile).
+ * These implementations in ds4_cuda.cu are the real ones. */
+
+extern "C" bool ds4_gpu_dsv4_turbo4_packv4_enabled(void) {
+    return getenv("DS4_KV_TURBO") != NULL;
+}
+
+extern "C" uint64_t ds4_gpu_dsv4_turbo4_packed_kv_row_bytes(uint32_t hd, uint32_t nr) {
+    return turbo4_row_bytes(hd, nr);
+}
+
+extern "C" uint64_t ds4_gpu_dsv4_turbo4_packed_kv_bytes(uint32_t nr, uint32_t hd, uint32_t nrot) {
+    return (uint64_t)nr * turbo4_row_bytes(hd, nrot);
+}
+
+extern "C" int ds4_gpu_dsv4_turbo4_pack_compressed_kv_tensor(
+        ds4_gpu_tensor *packed, const ds4_gpu_tensor *src,
+        uint32_t dst_row0, uint32_t src_row0, uint32_t n_rows,
+        uint32_t head_dim, uint32_t n_rot)
+{
+    if (!packed || !src || n_rows == 0) return 0;
+    uint64_t rb = turbo4_row_bytes(head_dim, n_rot);
+    uint8_t *dst = (uint8_t *)packed->ptr + (uint64_t)dst_row0 * rb;
+    const float *s = (const float *)src->ptr + (uint64_t)src_row0 * head_dim;
+    turbo4_pack_kernel<<<n_rows, 64>>>(dst, s, n_rows, head_dim, n_rot);
+    return cuda_ok(cudaGetLastError(), "turbo4_pack_compressed_kv");
+}
+
+extern "C" int ds4_gpu_dsv4_turbo4_unpack_compressed_kv_tensor(
+        ds4_gpu_tensor *dst, const ds4_gpu_tensor *packed,
+        uint32_t dst_row0, uint32_t src_row0, uint32_t n_rows,
+        uint32_t head_dim, uint32_t n_rot)
+{
+    if (!dst || !packed || n_rows == 0) return 0;
+    uint64_t rb = turbo4_row_bytes(head_dim, n_rot);
+    float *d = (float *)dst->ptr + (uint64_t)dst_row0 * head_dim;
+    const uint8_t *s = (const uint8_t *)packed->ptr + (uint64_t)src_row0 * rb;
+    turbo4_unpack_kernel<<<n_rows, 64>>>(d, s, n_rows, head_dim, n_rot);
+    return cuda_ok(cudaGetLastError(), "turbo4_unpack_compressed_kv");
+}
+
+extern "C" int ds4_gpu_dsv4_compressed_kv_quantize_tensor(
+        ds4_gpu_tensor *x, uint32_t n_tok, uint32_t head_dim, uint32_t n_rot)
+{
+    (void)x; (void)n_tok; (void)head_dim; (void)n_rot;
+    return 1;  /* no-op for the packed path; packing is done by pack_compressed_kv */
+}
+
+/* Temporary stub for the turbo4 attention kernel — not yet implemented.
+ * Returns 0 (not supported) so ds4 falls back to the FP32 attention path.
+ * This will be replaced with a real packed-FP8-reading attention kernel. */
+extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_turbo4_tensor(
+        ds4_gpu_tensor *heads, const void *mm, uint64_t ms, uint64_t soff,
+        const ds4_gpu_tensor *q, const ds4_gpu_tensor *rkv, const ds4_gpu_tensor *ckv,
+        const ds4_gpu_tensor *tk, uint32_t nt, uint32_t p0, uint32_t nr,
+        uint32_t rc, uint32_t rs, uint32_t nc, uint32_t t_k, uint32_t w,
+        uint32_t ratio, uint32_t nh, uint32_t hd) {
+    (void)heads; (void)mm; (void)ms; (void)soff; (void)q; (void)rkv; (void)ckv;
+    (void)tk; (void)nt; (void)p0; (void)nr; (void)rc; (void)rs; (void)nc;
+    (void)t_k; (void)w; (void)ratio; (void)nh; (void)hd;
+    return 0;  /* not supported — caller falls back to FP32 path */
 }

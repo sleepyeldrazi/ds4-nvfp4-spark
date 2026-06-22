@@ -1,4 +1,4 @@
-# ds4 — NVFP4 hybrid serving on DGX Spark (GB10)
+# ds4 - Mixed NVFP4 serving of DeepSeek V4 Flash on DGX Spark (GB10)
 
 > **⚠️ This GitHub repository is for archival / mirror purposes only.**
 > Active development happens at
@@ -76,7 +76,7 @@ compressed KV rows → more attention work per token (attention is still <1% of
 decode). The dominant cost (MoE weight loading) is prompt-length-independent.
 Always benchmark at the same prompt length before/after a change.
 
-Decode is **bandwidth-bound, not compute-bound** — the GPU draws ~33 W at 96%
+Decode is **bandwidth-bound, not compute-bound** - the GPU draws ~33 W at 96%
 utilization. Planned optimizations (MoE down expert-parallelism, software
 prefetch, CUDA Graph capture, kernel fusion) target ~13–15 t/s. MTP is planned
 as future work but requires retraining the draft heads to match the REAP-pruned
@@ -108,7 +108,7 @@ The 273 GB/s spec is physically unreachable for real workloads. The honest ceili
 | **IQ2_XXS** | 2.06 | **`__dp4a`** | **58.6** | **dequant-compute ✗** |
 
 **Key insight**: IQ2_XXS is dequant-compute-bound at 58 GB/s. NVFP4 reads *more*
-bytes (4.5 vs 2.06 bpw) but runs at 140 GB/s — the `__dp4a` kernel already beats
+bytes (4.5 vs 2.06 bpw) but runs at 140 GB/s - the `__dp4a` kernel already beats
 IQ2_XXS **2.4×** on the expert path. The hybrid recipe (NVFP4 gate/up + Q2_K
 down) is the optimal decode mix: NVFP4 matches or beats the raw speed of
 IQ2_XXS-level quants while delivering **far better precision** (4.5 bpw vs 2.06
@@ -124,9 +124,9 @@ make
 ```
 
 Builds three binaries:
-- `ds4` — interactive CLI
-- `ds4-server` — HTTP API server
-- `ds4-bench` — throughput benchmark
+- `ds4` - interactive CLI
+- `ds4-server` - HTTP API server
+- `ds4-bench` - throughput benchmark
 
 ### Quick serve
 
@@ -166,7 +166,7 @@ DS4_CUDA_MANAGED_MODEL=1 DS4_KV_TURBO=1 ./ds4 -m hybrid-K180.gguf -p "..." --ctx
 The quant recipe: gate (w1) + up (w3) experts → **NVFP4**, down (w2) experts →
 **Q2_K**, attention/shared/head → **copy from template** (preserves required
 f16/f32). Non-expert tensors use the copy policy (don't force `--attention q8_0`
-— it over-applies to f16-required HC tensors).
+- it over-applies to f16-required HC tensors).
 
 ## Verifying
 
@@ -199,13 +199,13 @@ engine routes around pruned experts without code changes.
 ### NVFP4 expert kernels
 
 The HF source experts are MXFP4 (e2m1 + e8m0 per-32). NVFP4 is e2m1 + e4m3
-per-16 + per-expert `scale_2`. The **e2m1 nibbles are identical** — MXFP4→NVFP4
+per-16 + per-expert `scale_2`. The **e2m1 nibbles are identical** - MXFP4→NVFP4
 is a lossless scale-only transform (no requant, no amax needed for weights).
 Verified bit-exact via round-trip test.
 
 The GGUF writer stores NVFP4 tensors with the ds4q NVFP4 type id **40**, which
 is intentionally not in ds4's `gguf_types` table. The loader prints
-`warning: tensor ... has unsupported GGUF type 40` for each NVFP4 tensor —
+`warning: tensor ... has unsupported GGUF type 40` for each NVFP4 tensor -
 **this is expected and harmless**: `ds4_weights.c` rebinds those tensors by
 name (`.nvfp4_weight`) and forces the dispatch type to 31.
 
@@ -218,16 +218,16 @@ in-place FP8 value quantization but wrote the result back into **FP32 buffers**
 - **Attention-compressed packed row (584 B vs 2048 B FP32 = 3.51×)**:
   `[ 448 e4m3 | 7 e8m0 scales | 1 pad | 128 B BF16 (rot) ]`
 - **Indexer-compressed packed row (200 B vs 512 B FP32 = 2.56×)**,
-  head_dim=128, n_rot=64 — reuses the same turbo4 pack/unpack kernels.
+  head_dim=128, n_rot=64 - reuses the same turbo4 pack/unpack kernels.
 - Uses CUDA 13 native `cuda_fp8.h` types (`__nv_fp8_e4m3`, `__nv_fp8_e8m0`).
 - GB10-specific: +1 pad byte for even BF16 alignment (misaligned 2-byte loads
   crash on sm_121a); BF16 via `uint16_t*` (sm_121a compiler bug workaround).
 - Correctness: greedy decode matches FP32 path 29/30 tokens (diverges at final
-  token — healthy FP8 quantization).
+  token - healthy FP8 quantization).
 
 ### Managed-memory serving
 
-GB10 has hardware ATS (`PageableMemAccessUsesHostPageTables=1`) — the GPU reads
+GB10 has hardware ATS (`PageableMemAccessUsesHostPageTables=1`) - the GPU reads
 CPU-allocated memory directly, coherent, no copy. This fork loads the GGUF into
 a `cudaMallocManaged` buffer (via chunked `pread` + `posix_fadvise DONTNEED`)
 with `cudaMemAdvise(SetReadMostly + SetPreferredLocation=device)` +
@@ -249,7 +249,7 @@ cache. Result: single residency at ~97 GB/s.
 - Inspired by [eouya2/ds4-for-reaped](https://github.com/eouya2/ds4-for-reaped)
   and the [0xSero/DeepSeek-V4-Flash-162B-GGUF](https://huggingface.co/0xSero/DeepSeek-V4-Flash-162B-GGUF)
   release, which motivated running a REAP'd DS-V4 Flash on the Spark.
-- Expert pruning follows **REAP — Router-weighted Expert Activation Pruning**
+- Expert pruning follows **REAP - Router-weighted Expert Activation Pruning**
   from ["REAP the Experts: Why Pruning Prevails for One-Shot MoE
   compression"](https://arxiv.org/abs/2510.13999) (Cerebras, ICLR 2026).
 - NVFP4 format follows NVIDIA Model-Optimizer's `NVFP4QTensor`.

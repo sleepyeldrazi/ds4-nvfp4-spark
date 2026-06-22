@@ -34,6 +34,8 @@ Profiled with `DS4_GPU_DECODE_STAGE_PROFILE=1` and `DS4_CUDA_MOE_PROFILE=1` at a
 several of the plan's magnitude assumptions and is the basis for the per-item
 verdicts below.
 
+### Per-stage (additive, with per-stage sync)
+
 | stage | ms/token | % | nature |
 |---|---|---|---|
 | attention | 23.8 | 23.1% | indexed-mixed decode attn over packed comp_kv (turbo4 direct) |
@@ -48,23 +50,50 @@ verdicts below.
 | router | 1.2 | 1.2% | |
 | **total** | **~103** | | (real decode ~104 ms → 9.6 t/s) |
 
-**Key takeaways:**
-- The decode is real GPU work at ~3.7× the 28 ms weight-bandwidth floor — there
-  is headroom, but it is scattered across many kernels, not one fat target.
+### CPU dispatch vs GPU execute (the real bottleneck)
+
+`DS4_GPU_GRAPH_TOKEN_PROFILE=1` splits the decode token into CPU `encode`
+(dispatch the 430 kernel launches) vs GPU `execute`:
+
+```
+encode (CPU dispatch) = ~98 ms / token   (95% of the token)
+execute (GPU work)     = ~4.1 ms / token  (the real GPU work)
+read (logits D2H)      = ~0.01 ms / token
+```
+
+`wd.sh` high-freq power/util logging confirms the same thing from the hardware
+side: during decode the GB10 GPU is at 0% util / 10-14W for **~90% of samples**,
+spiking to 93-94% util / 30-34W for only **~9%** of samples. Each ~104 ms
+token is ~4 ms of real GPU work + ~98 ms of CPU dispatch / launch gaps where
+the GPU sits idle. The split-flush (layers 0-3 flushed, 4-42 back-to-back)
+only overlaps the first 4 layers; layers 4-42 dispatch is serialized with an
+already-finished GPU.
+
+**This makes #5 (CUDA Graph capture) the top lever by a wide margin, not #6.**
+Replay collapses the 430 launches + ~98 ms CPU dispatch into one
+`cudaGraphLaunch` (~0.3 ms) + the ~4 ms of real GPU work. Theoretical floor
+~4-5 ms/token (~200 t/s); realistically ~25-40 t/s after per-token CPU
+sampling/KV bookkeeping and arg-buffer updates. A standalone probe
+(`tests/graph_probe.cu`) confirms graph replay cuts pure launch overhead ~3x
+vs manual dispatch.
+
+### Per-stage takeaways
+
+- The decode is **CPU-dispatch-bound, not GPU-work- or bandwidth-bound.** The
+  GPU does ~4 ms of real work per token and waits ~98 ms for the CPU.
 - **#1 (MoE down) is only 4.9 ms (5%)** — the plan's 10–20% estimate was based
   on a wrong magnitude. Skipped.
-- **#6 (attention) is 23.8 ms (23%)** — the plan called it <1%. It is actually
-  the single biggest stage. The turbo4-direct packed-read kernel is live; the
-  remaining win there is shared-mem staging of comp rows (#6), now higher
-  priority than the plan rated.
-- **q_path (12.2 ms) is NOT powf-bound.** A precomputed rope frequency table
-  (built + tried, then reverted) measured neutral — the fused norm+rope kernel
-  is latency/occupancy-bound (64 tiny blocks on 48 SMs), not transcendental-
-  bound. The lever for q_path is fewer/bigger kernels (fusion, CUDA Graph), not
-  a rope table.
-- `attn_output` (19.5 ms) and `q_path` (12.2 ms) together are 31.7 ms of Q8_0
-  GEMV + small kernels for attention projections — bandwidth/occupancy-bound,
-  not helped by tensor cores (M=1).
+- **#2 (prefetch)** predicted 5–15% — neutral on GB10 (managed pages already
+  device-resident, no TLB win). Kept (zero-risk).
+- **#6 (attention)** plan said <1% — it's 23% of the *profiled* total, but
+  that profile is dominated by CPU dispatch, not the `_t4_elem` compute.
+  Cooperative-dequant-to-shared would attack a slice of the ~4 ms of real GPU
+  work — worth doing *after* graphs, but graphs first.
+- **q_path (12.2 ms profiled)** is NOT powf-bound. A precomputed rope frequency
+  table (built + tried, then reverted) measured neutral — the fused norm+rope
+  kernel time is CPU-dispatch, not transcendental compute.
+- `attn_output` (19.5 ms) and `q_path` (12.2 ms) are likewise mostly CPU
+  dispatch for tiny Q8_0 GEMV / small kernels; graph capture reclaims them.
 
 ## What the codebase already does well
 
@@ -414,6 +443,19 @@ Call `ds4_gpu_env_cache_init()` once from `ds4_gpu_managed_prefetch` or the firs
 
 **Impact:** 2–5% (~2–5 ms/token). High effort, clean architecture win.
 
+> **UPDATE (profiled 2026-06-22): REVISED TO TOP PRIORITY, IMPACT 3-4x.**
+> `DS4_GPU_GRAPH_TOKEN_PROFILE=1` shows the decode token is **~98 ms CPU
+> dispatch + ~4 ms GPU execute + ~0.01 ms logits read**. The GPU does ~4 ms of
+> real work per token and sits idle ~98 ms waiting for the CPU to enqueue the
+> next token's ~430 launches. `wd.sh` confirms from the hardware side: 0%
+> util / 10-14W for ~90% of decode samples, 93-94% / 30-34W for ~9%.
+> The original 2-5% estimate assumed the split-flush overlapped most dispatch;
+> it only overlaps layers 0-3. Graph replay collapses the 430 launches + 98 ms
+> CPU dispatch into one `cudaGraphLaunch` (~0.3 ms) + 4 ms GPU work.
+> `tests/graph_probe.cu` confirms replay cuts launch overhead ~3x. Theoretical
+> floor ~4-5 ms/token (~200 t/s); realistically ~25-40 t/s after per-token
+> sampling/KV bookkeeping. **This is the lever.**
+
 ### Problem
 
 The decode path dispatches ~430 kernel launches per token. The split-flush
@@ -714,10 +756,10 @@ writes logits to shared memory, then the same block does top-k selection. Saves
 
 | Priority | Opportunity | Measured impact | Effort | Status |
 |----------|-------------|-----------------|--------|--------|
-| 1 | **#6** Turbo4 shared-mem staging | attention is 23.8 ms (23%) — biggest stage | Medium | **Next** |
-| 2 | **#5** CUDA Graph capture | 2–5% (launch/sync overhead) | Hard | Deferred (high effort, GPU-work-bound decode limits payoff) |
-| 3 | **#8B/C** More kernel fusion | 1–3% (launch + intermediate) | Medium | Low payoff given additive stage times |
-| 4 | **#1** MoE down expert-parallelism | ~2% (down is only 4.9 ms) | Medium | **Skipped** (not worth the complexity) |
+| 1 | **#5** CUDA Graph capture | **3-4x** (decode is 95% CPU dispatch, 5% GPU work) | Hard | **Next -- the lever** |
+| 2 | **#6** Turbo4 shared-mem / cooperative dequant | attacks part of the ~4 ms GPU work | Medium | After #5 (small slice once dispatch is gone) |
+| 3 | **#8B/C** More kernel fusion | <1% once graphs remove launch overhead | Medium | Low payoff post-#5 |
+| 4 | **#1** MoE down expert-parallelism | ~2% (down is only 4.9 ms, mostly dispatch) | Medium | **Skipped** |
 | 5 | **#7** Expert streaming buffer | ? | Easy-Med | Untested (UMA pages already device-resident → likely neutral like #2) |
 | — | **#2** Software prefetch | neutral | Easy | **Done** (kept, zero-risk) |
 | — | **#3** F16 __half2 loads | done | Medium | **Done** (in 9.65 t/s baseline) |
@@ -725,13 +767,13 @@ writes logits to shared memory, then the same block does top-k selection. Saves
 | — | **#8A** Fused Q norm+rope | done | Trivial | **Done** |
 
 **Net result so far:** #2/#3/#4/#8A land at **9.65 t/s** vs 9.4 baseline (~2.7%
-at medium prompt). The plan's predicted ~13–15 t/s assumed #1 (10–20%) and #2
-(5–15%), both of which do not materialize on GB10 UMA (down is small; pages are
-already device-resident so prefetch/TLB tricks are neutral). The real remaining
-lever is **#6 (attention shared-mem staging)** on the 23.8 ms attention stage;
-**#5 (CUDA Graph)** is the structural win but high-effort and GPU-work-bound.
-Beyond that, MTP (amortizes weight load across multiple tokens) is the path to
-the ~27 t/s architectural ceiling.
+at medium prompt) -- those were all tiny because the decode is CPU-dispatch-
+bound, not GPU-work-bound. The real lever is **#5 (CUDA Graph)**: decode is
+~98 ms CPU dispatch + ~4 ms GPU work, so replaying the tape with one
+`cudaGraphLaunch` targets a 3-4x decode speedup (→ ~25-40 t/s), not the 2-5%
+the dry plan estimated. **#6** becomes a small slice of the remaining ~4 ms of
+real GPU work after graphs. Beyond #5/#6, MTP (amortizes weight load across
+multiple tokens) is the path to the ~27 t/s weight-bandwidth ceiling.
 
 **When measuring:** always use the medium prompt (~3500 tokens) as the primary
 benchmark. Short-prompt numbers (12+ t/s) are misleading because they don't

@@ -469,7 +469,7 @@ static void cuda_q8_f16_cache_disable_after_failure(const char *what, uint64_t r
 static int cuda_q8_f16_cache_allowed(const char *label, uint64_t in_dim, uint64_t out_dim) {
     if (g_quality_mode) return 0;
     if (g_q8_f16_disabled_after_oom) return 0;
-    if (!DS4_ENV_BOOL("DS4_CUDA_NO_Q8_F16_CACHE")) return 0;
+    if (DS4_ENV_BOOL("DS4_CUDA_NO_Q8_F16_CACHE")) return 0;
     if (cuda_q8_f16_cache_limit_bytes() == 0) return 0;
     if (DS4_ENV_BOOL("DS4_CUDA_Q8_F16_ALL")) return 1;
     if (!label) return 0;

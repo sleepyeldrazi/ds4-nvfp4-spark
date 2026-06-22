@@ -135,6 +135,8 @@ extern uint64_t g_model_file_size;
 extern int g_model_cache_full;
 extern cudaStream_t g_model_prefetch_stream;
 extern cudaStream_t g_model_upload_stream;
+extern cudaStream_t g_launch_stream;   /* 0=default; set to capturable stream during graph capture */
+extern int g_in_capture;              /* set during stream-capture: flush/end are no-ops */
 extern cublasHandle_t g_cublas;
 extern int g_cublas_ready;
 extern int g_quality_mode;

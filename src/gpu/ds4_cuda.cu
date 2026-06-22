@@ -86,6 +86,12 @@ static uint64_t g_model_file_size;
 static int g_model_cache_full;
 static cudaStream_t g_model_prefetch_stream;
 static cudaStream_t g_model_upload_stream;
+/* Launch stream for all kernel dispatch. Defaults to 0 (default stream) so
+ * behavior is identical to the pre-graph path. During CUDA Graph capture this
+ * is swapped to a capturable non-blocking stream so the 430 decode launches
+ * are recorded into a graph instead of executed immediately. */
+cudaStream_t g_launch_stream = 0;
+int g_in_capture = 0;   /* set during stream-capture: flush/end become no-ops */
 static cublasHandle_t g_cublas;
 static int g_cublas_ready;
 static int g_quality_mode;
@@ -560,7 +566,7 @@ static const __half *cuda_q8_f16_ptr(
     }
     const uint64_t blocks = (in_dim + 31) / 32;
     const uint64_t n = in_dim * out_dim;
-    dequant_q8_0_to_f16_kernel<<<(n + 255) / 256, 256>>>(dev,
+    dequant_q8_0_to_f16_kernel<<<(n + 255) / 256, 256, 0, g_launch_stream>>>(dev,
                                                           (const unsigned char *)q8,
                                                           in_dim,
                                                           out_dim,
@@ -612,7 +618,7 @@ static float *cuda_q8_f32_ptr(
     }
     const uint64_t blocks = (in_dim + 31) / 32;
     const uint64_t n = in_dim * out_dim;
-    dequant_q8_0_to_f32_kernel<<<(n + 255) / 256, 256>>>(dev,
+    dequant_q8_0_to_f32_kernel<<<(n + 255) / 256, 256, 0, g_launch_stream>>>(dev,
                                                           (const unsigned char *)q8,
                                                           in_dim,
                                                           out_dim,
@@ -1355,8 +1361,64 @@ extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
 }
 
 extern "C" int ds4_gpu_begin_commands(void) { return 1; }
-extern "C" int ds4_gpu_flush_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "flush"); }
-extern "C" int ds4_gpu_end_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "end commands"); }
+extern "C" int ds4_gpu_flush_commands(void) {
+    if (g_in_capture) return 1;  /* no sync during graph capture */
+    return cuda_ok(cudaDeviceSynchronize(), "flush");
+}
+extern "C" int ds4_gpu_end_commands(void) {
+    if (g_in_capture) return 1;  /* no sync during graph capture */
+    return cuda_ok(cudaDeviceSynchronize(), "end commands");
+}
+extern "C" void ds4_gpu_set_launch_stream(void *stream) {
+    g_launch_stream = (cudaStream_t)stream;
+}
+extern "C" void *ds4_gpu_get_launch_stream(void) {
+    return (void *)g_launch_stream;
+}
+extern "C" int ds4_gpu_begin_capture(void *stream) {
+    cudaStream_t s = (cudaStream_t)stream;
+    cudaError_t err = cudaStreamBeginCapture(s, cudaStreamCaptureModeRelaxed);
+    if (!cuda_ok(err, "begin capture")) return 0;
+    g_in_capture = 1;
+    return 1;
+}
+extern "C" int ds4_gpu_end_capture(void *stream, void **graph_out) {
+    cudaStream_t s = (cudaStream_t)stream;
+    g_in_capture = 0;
+    cudaGraph_t g = NULL;
+    cudaError_t err = cudaStreamEndCapture(s, &g);
+    if (!cuda_ok(err, "end capture")) { if (g) cudaGraphDestroy(g); return 0; }
+    *graph_out = (void *)g;
+    return 1;
+}
+extern "C" int ds4_gpu_instantiate_graph(void *graph, void **exec_out) {
+    cudaGraphExec_t exec = NULL;
+    cudaError_t err = cudaGraphInstantiate(&exec, (cudaGraph_t)graph, 0);
+    if (!cuda_ok(err, "instantiate graph")) return 0;
+    *exec_out = (void *)exec;
+    return 1;
+}
+extern "C" int ds4_gpu_launch_graph(void *exec, void *stream) {
+    cudaError_t err = cudaGraphLaunch((cudaGraphExec_t)exec, (cudaStream_t)stream);
+    return cuda_ok(err, "launch graph");
+}
+extern "C" void ds4_gpu_destroy_exec(void *exec) {
+    if (exec) cudaGraphExecDestroy((cudaGraphExec_t)exec);
+}
+extern "C" void ds4_gpu_destroy_graph(void *graph) {
+    if (graph) cudaGraphDestroy((cudaGraph_t)graph);
+}
+extern "C" void *ds4_gpu_create_stream(void) {
+    cudaStream_t s = NULL;
+    if (!cuda_ok(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking), "create stream")) return NULL;
+    return (void *)s;
+}
+extern "C" void ds4_gpu_destroy_stream(void *stream) {
+    if (stream) cudaStreamDestroy((cudaStream_t)stream);
+}
+extern "C" int ds4_gpu_sync_stream(void *stream) {
+    return cuda_ok(cudaStreamSynchronize((cudaStream_t)stream), "sync stream");
+}
 extern "C" int ds4_gpu_synchronize(void) { return cuda_ok(cudaDeviceSynchronize(), "synchronize"); }
 
 extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
@@ -1631,7 +1693,7 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_turbo4_tensor(
     /* Launch kernel: 8 heads per block, 256 threads (4 warps). */
     if (nt == 1 && hd == 512) {
         dim3 grid(1, (nh + 7u) / 8u, 1);
-        attention_indexed_mixed_heads8_online_turbo4_kernel<<<grid, 256>>>(
+        attention_indexed_mixed_heads8_online_turbo4_kernel<<<grid, 256, 0, g_launch_stream>>>(
                 (float *)heads->ptr, sinks, (const float *)q->ptr,
                 (const float *)rkv->ptr,
                 (const uint8_t *)ckv->ptr, (const int32_t *)tk->ptr,

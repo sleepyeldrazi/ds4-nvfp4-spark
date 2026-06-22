@@ -160,7 +160,7 @@ static int routed_moe_launch(
         uint32_t tile_capacity = 0;
         uint32_t tile16_capacity = 0;
         dim3 xq_grid(xq_blocks, n_tokens, 1);
-        q8_K_quantize_kernel<<<xq_grid, 256>>>(xq, (const float *)x->ptr, expert_in_dim, n_tokens);
+        q8_K_quantize_kernel<<<xq_grid, 256, 0, g_launch_stream>>>(xq, (const float *)x->ptr, expert_in_dim, n_tokens);
         ok = cuda_ok(cudaGetLastError(), "routed_moe x quantize launch");
         if (prof_ev[1]) (void)cudaEventRecord(prof_ev[1], 0);
         if (ok && use_sorted_pairs) {
@@ -208,18 +208,18 @@ static int routed_moe_launch(
                 tile16_starts = use_down_tile16 ? (uint32_t *)(scratch + tile16_starts_off) : NULL;
                 ok = cuda_ok(cudaMemset(counts, 0, counts_bytes), "routed_moe sorted counts clear");
                 if (ok) {
-                    moe_count_sorted_pairs_kernel<<<(pair_count + 255u) / 256u, 256>>>(
+                    moe_count_sorted_pairs_kernel<<<(pair_count + 255u) / 256u, 256, 0, g_launch_stream>>>(
                         counts,
                         (const int32_t *)selected->ptr,
                         pair_count);
                     ok = cuda_ok(cudaGetLastError(), "routed_moe sorted count launch");
                 }
                 if (ok) {
-                    moe_prefix_sorted_pairs_kernel<<<1, 1>>>(offsets, cursors, counts);
+                    moe_prefix_sorted_pairs_kernel<<<1, 1, 0, g_launch_stream>>>(offsets, cursors, counts);
                     ok = cuda_ok(cudaGetLastError(), "routed_moe sorted prefix launch");
                 }
                 if (ok) {
-                    moe_scatter_sorted_pairs_kernel<<<(pair_count + 255u) / 256u, 256>>>(
+                    moe_scatter_sorted_pairs_kernel<<<(pair_count + 255u) / 256u, 256, 0, g_launch_stream>>>(
                         sorted_pairs,
                         cursors,
                         (const int32_t *)selected->ptr,
@@ -227,19 +227,19 @@ static int routed_moe_launch(
                     ok = cuda_ok(cudaGetLastError(), "routed_moe sorted scatter launch");
                 }
                 if (ok && use_expert_tiles) {
-                    moe_build_expert_tile_offsets_kernel<<<1, 1>>>(tile_offsets, tile_total, counts, expert_tile_m);
+                    moe_build_expert_tile_offsets_kernel<<<1, 1, 0, g_launch_stream>>>(tile_offsets, tile_total, counts, expert_tile_m);
                     ok = cuda_ok(cudaGetLastError(), "routed_moe expert tile offsets launch");
                 }
                 if (ok && use_expert_tiles) {
-                    moe_build_expert_tiles_kernel<<<1, 256>>>(tile_experts, tile_starts, tile_offsets, counts, expert_tile_m);
+                    moe_build_expert_tiles_kernel<<<1, 256, 0, g_launch_stream>>>(tile_experts, tile_starts, tile_offsets, counts, expert_tile_m);
                     ok = cuda_ok(cudaGetLastError(), "routed_moe expert tiles launch");
                 }
                 if (ok && use_expert_tiles && use_down_tile16) {
-                    moe_build_expert_tile_offsets_kernel<<<1, 1>>>(tile16_offsets, tile16_total, counts, 16u);
+                    moe_build_expert_tile_offsets_kernel<<<1, 1, 0, g_launch_stream>>>(tile16_offsets, tile16_total, counts, 16u);
                     ok = cuda_ok(cudaGetLastError(), "routed_moe expert tile16 offsets launch");
                 }
                 if (ok && use_expert_tiles && use_down_tile16) {
-                    moe_build_expert_tiles_kernel<<<1, 256>>>(tile16_experts, tile16_starts, tile16_offsets, counts, 16u);
+                    moe_build_expert_tiles_kernel<<<1, 256, 0, g_launch_stream>>>(tile16_experts, tile16_starts, tile16_offsets, counts, 16u);
                     ok = cuda_ok(cudaGetLastError(), "routed_moe expert tile16 launch");
                 }
             }
@@ -252,7 +252,7 @@ static int routed_moe_launch(
                     const uint32_t span = use_gate_row2048 ? gate_row_span : 1024u;
                     if (span == 512u) {
                         dim3 tgrid((expert_mid_dim + 511u) / 512u, tile_capacity, 1);
-                        moe_gate_up_mid_expert_tile8_rowspan_nvfp4_kernel<512><<<tgrid, 256>>>(
+                        moe_gate_up_mid_expert_tile8_rowspan_nvfp4_kernel<512><<<tgrid, 256, 0, g_launch_stream>>>(
                             (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
                             gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
                             tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
@@ -260,7 +260,7 @@ static int routed_moe_launch(
                             write_gate_up, clamp, d_gate_scale_2, d_up_scale_2);
                     } else if (span == 1024u) {
                         dim3 tgrid((expert_mid_dim + 1023u) / 1024u, tile_capacity, 1);
-                        moe_gate_up_mid_expert_tile8_rowspan_nvfp4_kernel<1024><<<tgrid, 256>>>(
+                        moe_gate_up_mid_expert_tile8_rowspan_nvfp4_kernel<1024><<<tgrid, 256, 0, g_launch_stream>>>(
                             (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
                             gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
                             tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
@@ -268,7 +268,7 @@ static int routed_moe_launch(
                             write_gate_up, clamp, d_gate_scale_2, d_up_scale_2);
                     } else {
                         dim3 tgrid((expert_mid_dim + 2047u) / 2048u, tile_capacity, 1);
-                        moe_gate_up_mid_expert_tile8_rowspan_nvfp4_kernel<2048><<<tgrid, 256>>>(
+                        moe_gate_up_mid_expert_tile8_rowspan_nvfp4_kernel<2048><<<tgrid, 256, 0, g_launch_stream>>>(
                             (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
                             gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
                             tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
@@ -278,7 +278,7 @@ static int routed_moe_launch(
                 } else if (ok) {
                     /* NVFP4 n_tokens==1 decode path — one thread block per (row_chunk, pair). */
                     dim3 qgrid((expert_mid_dim + 127u) / 128u, n_tokens * n_expert, 1);
-                    moe_gate_up_mid_decode_lut_nvfp4_kernel<<<qgrid, 256>>>(
+                    moe_gate_up_mid_decode_lut_nvfp4_kernel<<<qgrid, 256, 0, g_launch_stream>>>(
                         (float *)gate->ptr,
                         (float *)up->ptr,
                         (float *)mid->ptr,
@@ -302,7 +302,7 @@ static int routed_moe_launch(
                 if (use_gate_row2048) {
                     if (gate_row_span == 512u) {
                         dim3 tgrid((expert_mid_dim + 511u) / 512u, tile_capacity, 1);
-                        moe_gate_up_mid_expert_tile8_rowspan_kernel<512><<<tgrid, 256>>>(
+                        moe_gate_up_mid_expert_tile8_rowspan_kernel<512><<<tgrid, 256, 0, g_launch_stream>>>(
                             (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
                             gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
                             tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
@@ -310,7 +310,7 @@ static int routed_moe_launch(
                             write_gate_up, clamp);
                     } else if (gate_row_span == 1024u) {
                         dim3 tgrid((expert_mid_dim + 1023u) / 1024u, tile_capacity, 1);
-                        moe_gate_up_mid_expert_tile8_rowspan_kernel<1024><<<tgrid, 256>>>(
+                        moe_gate_up_mid_expert_tile8_rowspan_kernel<1024><<<tgrid, 256, 0, g_launch_stream>>>(
                             (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
                             gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
                             tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
@@ -318,7 +318,7 @@ static int routed_moe_launch(
                             write_gate_up, clamp);
                     } else {
                         dim3 tgrid((expert_mid_dim + 2047u) / 2048u, tile_capacity, 1);
-                        moe_gate_up_mid_expert_tile8_row2048_kernel<<<tgrid, 256>>>(
+                        moe_gate_up_mid_expert_tile8_row2048_kernel<<<tgrid, 256, 0, g_launch_stream>>>(
                             (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
                             gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
                             tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
@@ -327,7 +327,7 @@ static int routed_moe_launch(
                     }
                 } else if (expert_tile_m == 8u) {
                     dim3 tgrid((expert_mid_dim + 31u) / 32u, tile_capacity, 1);
-                    moe_gate_up_mid_expert_tile8_row32_kernel<<<tgrid, 256>>>(
+                    moe_gate_up_mid_expert_tile8_row32_kernel<<<tgrid, 256, 0, g_launch_stream>>>(
                         (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
                         gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
                         tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
@@ -335,7 +335,7 @@ static int routed_moe_launch(
                         write_gate_up, clamp);
                 } else {
                     dim3 tgrid((expert_mid_dim + 31u) / 32u, tile_capacity, 1);
-                    moe_gate_up_mid_expert_tile4_row32_kernel<<<tgrid, 256>>>(
+                    moe_gate_up_mid_expert_tile4_row32_kernel<<<tgrid, 256, 0, g_launch_stream>>>(
                         (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
                         gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
                         tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
@@ -344,7 +344,7 @@ static int routed_moe_launch(
                 }
             } else if (ok && sorted_pairs && use_p2_sorted) {
                 dim3 p2_mgrid((expert_mid_dim + 15u) / 16u, (pair_count + 1u) / 2u, 1);
-                moe_gate_up_mid_sorted_p2_qwarp32_kernel<<<p2_mgrid, 256>>>(
+                moe_gate_up_mid_sorted_p2_qwarp32_kernel<<<p2_mgrid, 256, 0, g_launch_stream>>>(
                     (float *)gate->ptr,
                     (float *)up->ptr,
                     (float *)mid->ptr,
@@ -362,7 +362,7 @@ static int routed_moe_launch(
                     pair_count,
                     clamp);
             } else if (ok && sorted_pairs) {
-                moe_gate_up_mid_sorted_qwarp32_kernel<<<mgrid, 256>>>(
+                moe_gate_up_mid_sorted_qwarp32_kernel<<<mgrid, 256, 0, g_launch_stream>>>(
                     (float *)gate->ptr,
                     (float *)up->ptr,
                     (float *)mid->ptr,
@@ -381,7 +381,7 @@ static int routed_moe_launch(
             } else if (ok) {
                 dim3 qgrid((expert_mid_dim + 127u) / 128u, n_tokens * n_expert, 1);
                 if (use_decode_lut_gate && q4k_path) {
-                    moe_gate_up_mid_decode_q4K_qwarp32_kernel<<<qgrid, 256>>>(
+                    moe_gate_up_mid_decode_q4K_qwarp32_kernel<<<qgrid, 256, 0, g_launch_stream>>>(
                         (float *)gate->ptr,
                         (float *)up->ptr,
                         (float *)mid->ptr,
@@ -398,7 +398,7 @@ static int routed_moe_launch(
                         write_gate_up,
                         clamp);
                 } else if (use_decode_lut_gate) {
-                    moe_gate_up_mid_decode_lut_qwarp32_kernel<<<qgrid, 256>>>(
+                    moe_gate_up_mid_decode_lut_qwarp32_kernel<<<qgrid, 256, 0, g_launch_stream>>>(
                         (float *)gate->ptr,
                         (float *)up->ptr,
                         (float *)mid->ptr,
@@ -415,7 +415,7 @@ static int routed_moe_launch(
                         write_gate_up,
                         clamp);
                 } else {
-                    moe_gate_up_mid_qwarp32_kernel<<<qgrid, 256>>>(
+                    moe_gate_up_mid_qwarp32_kernel<<<qgrid, 256, 0, g_launch_stream>>>(
                         (float *)gate->ptr,
                         (float *)up->ptr,
                         (float *)mid->ptr,
@@ -437,7 +437,7 @@ static int routed_moe_launch(
         if (prof_ev[3]) (void)cudaEventRecord(prof_ev[3], 0);
         if (ok) {
             dim3 midq_grid(midq_blocks, n_tokens * n_expert, 1);
-            q8_K_quantize_kernel<<<midq_grid, 256>>>(midq, (const float *)mid->ptr, expert_mid_dim, n_tokens * n_expert);
+            q8_K_quantize_kernel<<<midq_grid, 256, 0, g_launch_stream>>>(midq, (const float *)mid->ptr, expert_mid_dim, n_tokens * n_expert);
             ok = cuda_ok(cudaGetLastError(), "routed_moe mid quantize launch");
         }
         if (prof_ev[4]) (void)cudaEventRecord(prof_ev[4], 0);
@@ -456,7 +456,7 @@ static int routed_moe_launch(
             if (use_direct_down_sum6 && !down_nvfp4) {
                 dim3 sgrid((out_dim + 31u) / 32u, 1, 1);
                 if (q4k_path) {
-                    moe_down_q4K_sum6_qwarp32_kernel<<<sgrid, 256>>>(
+                    moe_down_q4K_sum6_qwarp32_kernel<<<sgrid, 256, 0, g_launch_stream>>>(
                         (float *)out->ptr,
                         down_w,
                         midq,
@@ -466,7 +466,7 @@ static int routed_moe_launch(
                         midq_blocks,
                         out_dim);
                 } else {
-                    moe_down_sum6_qwarp32_kernel<<<sgrid, 256>>>(
+                    moe_down_sum6_qwarp32_kernel<<<sgrid, 256, 0, g_launch_stream>>>(
                         (float *)out->ptr,
                         down_w,
                         midq,
@@ -478,13 +478,13 @@ static int routed_moe_launch(
                 }
             } else if (use_atomic_down) {
                 uint64_t n = (uint64_t)n_tokens * out_dim;
-                zero_kernel<<<(n + 255u) / 256u, 256>>>((float *)out->ptr, n);
+                zero_kernel<<<(n + 255u) / 256u, 256, 0, g_launch_stream>>>((float *)out->ptr, n);
                 ok = cuda_ok(cudaGetLastError(), "routed_moe atomic zero launch");
             }
             if (down_nvfp4) {
                 if (use_direct_down_sum6) {
                     dim3 sgrid((out_dim + 31u) / 32u, 1, 1);
-                    moe_down_sum6_nvfp4_qwarp32_kernel<<<sgrid, 256>>>(
+                    moe_down_sum6_nvfp4_qwarp32_kernel<<<sgrid, 256, 0, g_launch_stream>>>(
                         (float *)out->ptr,
                         down_w,
                         midq,
@@ -500,21 +500,21 @@ static int routed_moe_launch(
                     const uint32_t span = use_down_row2048 ? down_row_span : 2048u;
                     if (span == 512u) {
                         dim3 tgrid((out_dim + 511u) / 512u, down_tile_capacity, 1);
-                        moe_down_expert_tile16_rowspan_nvfp4_kernel<512><<<tgrid, 256>>>(
+                        moe_down_expert_tile16_rowspan_nvfp4_kernel<512><<<tgrid, 256, 0, g_launch_stream>>>(
                             use_atomic_down ? (float *)out->ptr : (float *)down->ptr,
                             down_w, midq, sorted_pairs, sorted_offsets, sorted_counts,
                             down_tile_total, down_tile_experts, down_tile_starts, down_expert_bytes, down_row_bytes,
                             midq_blocks, out_dim, n_expert, use_atomic_down, d_down_scale_2);
                     } else if (span == 1024u) {
                         dim3 tgrid((out_dim + 1023u) / 1024u, down_tile_capacity, 1);
-                        moe_down_expert_tile16_rowspan_nvfp4_kernel<1024><<<tgrid, 256>>>(
+                        moe_down_expert_tile16_rowspan_nvfp4_kernel<1024><<<tgrid, 256, 0, g_launch_stream>>>(
                             use_atomic_down ? (float *)out->ptr : (float *)down->ptr,
                             down_w, midq, sorted_pairs, sorted_offsets, sorted_counts,
                             down_tile_total, down_tile_experts, down_tile_starts, down_expert_bytes, down_row_bytes,
                             midq_blocks, out_dim, n_expert, use_atomic_down, d_down_scale_2);
                     } else {
                         dim3 tgrid((out_dim + 2047u) / 2048u, down_tile_capacity, 1);
-                        moe_down_expert_tile16_rowspan_nvfp4_kernel<2048><<<tgrid, 256>>>(
+                        moe_down_expert_tile16_rowspan_nvfp4_kernel<2048><<<tgrid, 256, 0, g_launch_stream>>>(
                             use_atomic_down ? (float *)out->ptr : (float *)down->ptr,
                             down_w, midq, sorted_pairs, sorted_offsets, sorted_counts,
                             down_tile_total, down_tile_experts, down_tile_starts, down_expert_bytes, down_row_bytes,
@@ -532,13 +532,13 @@ static int routed_moe_launch(
                     if (down_row_span == 512u) {
                         dim3 tgrid((out_dim + 511u) / 512u, down_tile_capacity, 1);
                         if (use_down_block16) {
-                            moe_down_expert_tile16_rowspan_block16_kernel<512><<<tgrid, 256>>>(
+                            moe_down_expert_tile16_rowspan_block16_kernel<512><<<tgrid, 256, 0, g_launch_stream>>>(
                                 use_atomic_down ? (float *)out->ptr : (float *)down->ptr,
                                 down_w, midq, sorted_pairs, sorted_offsets, sorted_counts,
                                 down_tile_total, down_tile_experts, down_tile_starts, down_expert_bytes, down_row_bytes,
                                 midq_blocks, out_dim, n_expert, use_atomic_down);
                         } else {
-                            moe_down_expert_tile16_rowspan_kernel<512><<<tgrid, 256>>>(
+                            moe_down_expert_tile16_rowspan_kernel<512><<<tgrid, 256, 0, g_launch_stream>>>(
                                 use_atomic_down ? (float *)out->ptr : (float *)down->ptr,
                                 down_w, midq, sorted_pairs, sorted_offsets, sorted_counts,
                                 down_tile_total, down_tile_experts, down_tile_starts, down_expert_bytes, down_row_bytes,
@@ -547,13 +547,13 @@ static int routed_moe_launch(
                     } else if (down_row_span == 1024u) {
                         dim3 tgrid((out_dim + 1023u) / 1024u, down_tile_capacity, 1);
                         if (use_down_block16) {
-                            moe_down_expert_tile16_rowspan_block16_kernel<1024><<<tgrid, 256>>>(
+                            moe_down_expert_tile16_rowspan_block16_kernel<1024><<<tgrid, 256, 0, g_launch_stream>>>(
                                 use_atomic_down ? (float *)out->ptr : (float *)down->ptr,
                                 down_w, midq, sorted_pairs, sorted_offsets, sorted_counts,
                                 down_tile_total, down_tile_experts, down_tile_starts, down_expert_bytes, down_row_bytes,
                                 midq_blocks, out_dim, n_expert, use_atomic_down);
                         } else {
-                            moe_down_expert_tile16_rowspan_kernel<1024><<<tgrid, 256>>>(
+                            moe_down_expert_tile16_rowspan_kernel<1024><<<tgrid, 256, 0, g_launch_stream>>>(
                                 use_atomic_down ? (float *)out->ptr : (float *)down->ptr,
                                 down_w, midq, sorted_pairs, sorted_offsets, sorted_counts,
                                 down_tile_total, down_tile_experts, down_tile_starts, down_expert_bytes, down_row_bytes,
@@ -562,13 +562,13 @@ static int routed_moe_launch(
                     } else {
                         dim3 tgrid((out_dim + 2047u) / 2048u, down_tile_capacity, 1);
                         if (use_down_block16) {
-                            moe_down_expert_tile16_rowspan_block16_kernel<2048><<<tgrid, 256>>>(
+                            moe_down_expert_tile16_rowspan_block16_kernel<2048><<<tgrid, 256, 0, g_launch_stream>>>(
                                 use_atomic_down ? (float *)out->ptr : (float *)down->ptr,
                                 down_w, midq, sorted_pairs, sorted_offsets, sorted_counts,
                                 down_tile_total, down_tile_experts, down_tile_starts, down_expert_bytes, down_row_bytes,
                                 midq_blocks, out_dim, n_expert, use_atomic_down);
                         } else {
-                            moe_down_expert_tile16_row2048_kernel<<<tgrid, 256>>>(
+                            moe_down_expert_tile16_row2048_kernel<<<tgrid, 256, 0, g_launch_stream>>>(
                                 use_atomic_down ? (float *)out->ptr : (float *)down->ptr,
                                 down_w, midq, sorted_pairs, sorted_offsets, sorted_counts,
                                 down_tile_total, down_tile_experts, down_tile_starts, down_expert_bytes, down_row_bytes,
@@ -577,21 +577,21 @@ static int routed_moe_launch(
                     }
                 } else if (use_down_tile16) {
                     dim3 tgrid((out_dim + 31u) / 32u, down_tile_capacity, 1);
-                    moe_down_expert_tile16_row32_kernel<<<tgrid, 256>>>(
+                    moe_down_expert_tile16_row32_kernel<<<tgrid, 256, 0, g_launch_stream>>>(
                         use_atomic_down ? (float *)out->ptr : (float *)down->ptr,
                         down_w, midq, sorted_pairs, sorted_offsets, sorted_counts,
                         down_tile_total, down_tile_experts, down_tile_starts, down_expert_bytes, down_row_bytes,
                         midq_blocks, out_dim, n_expert, use_atomic_down);
                 } else if (expert_tile_m == 8u) {
                     dim3 tgrid((out_dim + 31u) / 32u, down_tile_capacity, 1);
-                    moe_down_expert_tile8_row32_kernel<<<tgrid, 256>>>(
+                    moe_down_expert_tile8_row32_kernel<<<tgrid, 256, 0, g_launch_stream>>>(
                         use_atomic_down ? (float *)out->ptr : (float *)down->ptr,
                         down_w, midq, sorted_pairs, sorted_offsets, sorted_counts,
                         down_tile_total, down_tile_experts, down_tile_starts, down_expert_bytes, down_row_bytes,
                         midq_blocks, out_dim, n_expert, use_atomic_down);
                 } else {
                     dim3 tgrid((out_dim + 31u) / 32u, down_tile_capacity, 1);
-                    moe_down_expert_tile4_row32_kernel<<<tgrid, 256>>>(
+                    moe_down_expert_tile4_row32_kernel<<<tgrid, 256, 0, g_launch_stream>>>(
                         use_atomic_down ? (float *)out->ptr : (float *)down->ptr,
                         down_w, midq, sorted_pairs, sorted_offsets, sorted_counts,
                         down_tile_total, down_tile_experts, down_tile_starts, down_expert_bytes, down_row_bytes,
@@ -599,7 +599,7 @@ static int routed_moe_launch(
                 }
             } else if (sorted_pairs && use_p2_sorted) {
                 dim3 p2_dgrid((out_dim + 15u) / 16u, (pair_count + 1u) / 2u, 1);
-                moe_down_sorted_p2_qwarp32_kernel<<<p2_dgrid, 256>>>(
+                moe_down_sorted_p2_qwarp32_kernel<<<p2_dgrid, 256, 0, g_launch_stream>>>(
                     (float *)down->ptr,
                     down_w,
                     midq,
@@ -612,7 +612,7 @@ static int routed_moe_launch(
                     n_expert,
                     pair_count);
             } else if (sorted_pairs) {
-                moe_down_sorted_qwarp32_kernel<<<dgrid, 256>>>(
+                moe_down_sorted_qwarp32_kernel<<<dgrid, 256, 0, g_launch_stream>>>(
                     (float *)down->ptr,
                     down_w,
                     midq,
@@ -624,7 +624,7 @@ static int routed_moe_launch(
                     out_dim,
                     n_expert);
             } else {
-                moe_down_qwarp32_kernel<<<dgrid, 256>>>(
+                moe_down_qwarp32_kernel<<<dgrid, 256, 0, g_launch_stream>>>(
                     (float *)down->ptr,
                     down_w,
                     midq,
@@ -640,7 +640,7 @@ static int routed_moe_launch(
         if (prof_ev[5]) (void)cudaEventRecord(prof_ev[5], 0);
         if (ok && !use_atomic_down && !use_direct_down_sum6) {
             uint64_t n = (uint64_t)n_tokens * out_dim;
-            moe_sum_kernel<<<(n + 255) / 256, 256>>>((float *)out->ptr, (const float *)down->ptr, out_dim, n_expert, n_tokens);
+            moe_sum_kernel<<<(n + 255) / 256, 256, 0, g_launch_stream>>>((float *)out->ptr, (const float *)down->ptr, out_dim, n_expert, n_tokens);
             ok = cuda_ok(cudaGetLastError(), "routed_moe sum launch");
         }
         if (prof_ev[6]) {
@@ -665,7 +665,7 @@ static int routed_moe_launch(
 
     if (ok) {
         dim3 mgrid(expert_mid_dim, n_tokens * n_expert, 1);
-        moe_gate_up_mid_f32_kernel<<<mgrid, 256>>>(
+        moe_gate_up_mid_f32_kernel<<<mgrid, 256, 0, g_launch_stream>>>(
             (float *)gate->ptr,
             (float *)up->ptr,
             (float *)mid->ptr,
@@ -684,7 +684,7 @@ static int routed_moe_launch(
     }
     if (ok) {
         dim3 dgrid(out_dim, n_tokens * n_expert, 1);
-        moe_down_f32_kernel<<<dgrid, 256>>>(
+        moe_down_f32_kernel<<<dgrid, 256, 0, g_launch_stream>>>(
             (float *)down->ptr,
             down_w,
             (const float *)mid->ptr,
@@ -698,7 +698,7 @@ static int routed_moe_launch(
     }
     if (ok) {
         uint64_t n = (uint64_t)n_tokens * out_dim;
-        moe_sum_kernel<<<(n + 255) / 256, 256>>>((float *)out->ptr, (const float *)down->ptr, out_dim, n_expert, n_tokens);
+        moe_sum_kernel<<<(n + 255) / 256, 256, 0, g_launch_stream>>>((float *)out->ptr, (const float *)down->ptr, out_dim, n_expert, n_tokens);
         ok = cuda_ok(cudaGetLastError(), "routed_moe sum launch");
     }
     /* Cleanup device scale_2 arrays. */

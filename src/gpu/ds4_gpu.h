@@ -34,6 +34,21 @@ int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
 int ds4_gpu_begin_commands(void);
 int ds4_gpu_flush_commands(void);
 int ds4_gpu_end_commands(void);
+
+/* ---- CUDA Graph capture / replay (decode-path optimization) ---- */
+/* All kernel launches go to the set launch stream (default 0 = default stream).
+ * During capture, set it to a non-blocking capturable stream. */
+void ds4_gpu_set_launch_stream(void *stream);
+void *ds4_gpu_get_launch_stream(void);
+void *ds4_gpu_create_stream(void);
+void ds4_gpu_destroy_stream(void *stream);
+int ds4_gpu_sync_stream(void *stream);
+int ds4_gpu_begin_capture(void *stream);
+int ds4_gpu_end_capture(void *stream, void **graph_out);
+int ds4_gpu_instantiate_graph(void *graph, void **exec_out);
+int ds4_gpu_launch_graph(void *exec, void *stream);
+void ds4_gpu_destroy_exec(void *exec);
+void ds4_gpu_destroy_graph(void *graph);
 int ds4_gpu_synchronize(void);
 
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);

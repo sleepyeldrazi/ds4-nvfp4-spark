@@ -199,7 +199,7 @@ extern "C" int ds4_gpu_dsv4_turbo4_pack_compressed_kv_tensor(
     uint64_t rb = turbo4_row_bytes(head_dim, n_rot);
     uint8_t *dst = (uint8_t *)packed->ptr + (uint64_t)dst_row0 * rb;
     const float *s = (const float *)src->ptr + (uint64_t)src_row0 * head_dim;
-    turbo4_pack_kernel<<<n_rows, 64>>>(dst, s, n_rows, head_dim, n_rot);
+    turbo4_pack_kernel<<<n_rows, 64, 0, g_launch_stream>>>(dst, s, n_rows, head_dim, n_rot);
     return cuda_ok(cudaGetLastError(), "turbo4_pack_compressed_kv");
 }
 
@@ -212,7 +212,7 @@ extern "C" int ds4_gpu_dsv4_turbo4_unpack_compressed_kv_tensor(
     uint64_t rb = turbo4_row_bytes(head_dim, n_rot);
     float *d = (float *)dst->ptr + (uint64_t)dst_row0 * head_dim;
     const uint8_t *s = (const uint8_t *)packed->ptr + (uint64_t)src_row0 * rb;
-    turbo4_unpack_kernel<<<n_rows, 64>>>(d, s, n_rows, head_dim, n_rot);
+    turbo4_unpack_kernel<<<n_rows, 64, 0, g_launch_stream>>>(d, s, n_rows, head_dim, n_rot);
     return cuda_ok(cudaGetLastError(), "turbo4_unpack_compressed_kv");
 }
 

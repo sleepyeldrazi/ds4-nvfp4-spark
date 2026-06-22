@@ -26,6 +26,46 @@
 > No room for a second copy of weights. All proposals must be RAM-neutral or
 > RAM-negative.
 
+## Measured decode profile (K180 @ GB10, 2026-06-22)
+
+Profiled with `DS4_GPU_DECODE_STAGE_PROFILE=1` and `DS4_CUDA_MOE_PROFILE=1` at a
+~3500-token prompt (`--ctx 1048576`). Stage times are additive (profiled total
+103 ms ≈ real 104 ms, so per-stage sync does not inflate much). This overturns
+several of the plan's magnitude assumptions and is the basis for the per-item
+verdicts below.
+
+| stage | ms/token | % | nature |
+|---|---|---|---|
+| attention | 23.8 | 23.1% | indexed-mixed decode attn over packed comp_kv (turbo4 direct) |
+| routed_moe | 22.3 | 21.7% | gateup 15.8 (bw-bound) + down 4.9 |
+| attn_output | 19.5 | 18.9% | Q8_0 GEMV, M=1, attention output projection (F16-cached) |
+| q_path | 12.2 | 11.9% | fused head_rms_norm + rope_tail, latency/occupancy-bound (NOT powf-bound) |
+| compressor_indexer | 9.5 | 9.2% | indexer scoring over comp rows |
+| shared_gate_up | 5.1 | 4.9% | shared expert gate/up (Q8_0) |
+| ffn_hc_pre | 3.0 | 2.9% | HC split+norm |
+| shared_down | 2.9 | 2.8% | |
+| attn_hc_pre | 2.6 | 2.5% | |
+| router | 1.2 | 1.2% | |
+| **total** | **~103** | | (real decode ~104 ms → 9.6 t/s) |
+
+**Key takeaways:**
+- The decode is real GPU work at ~3.7× the 28 ms weight-bandwidth floor — there
+  is headroom, but it is scattered across many kernels, not one fat target.
+- **#1 (MoE down) is only 4.9 ms (5%)** — the plan's 10–20% estimate was based
+  on a wrong magnitude. Skipped.
+- **#6 (attention) is 23.8 ms (23%)** — the plan called it <1%. It is actually
+  the single biggest stage. The turbo4-direct packed-read kernel is live; the
+  remaining win there is shared-mem staging of comp rows (#6), now higher
+  priority than the plan rated.
+- **q_path (12.2 ms) is NOT powf-bound.** A precomputed rope frequency table
+  (built + tried, then reverted) measured neutral — the fused norm+rope kernel
+  is latency/occupancy-bound (64 tiny blocks on 48 SMs), not transcendental-
+  bound. The lever for q_path is fewer/bigger kernels (fusion, CUDA Graph), not
+  a rope table.
+- `attn_output` (19.5 ms) and `q_path` (12.2 ms) together are 31.7 ms of Q8_0
+  GEMV + small kernels for attention projections — bandwidth/occupancy-bound,
+  not helped by tensor cores (M=1).
+
 ## What the codebase already does well
 
 - **Split-flush pipelining:** `gpu_graph_encode_token_raw_swa` (ds4_gpu.inc:2905)
@@ -53,6 +93,19 @@
 ## Opportunity 1 — MoE down: parallelize 6 experts across warps
 
 **Impact:** 10–20% (~10–20 ms/token). Highest-impact kernel-level change.
+
+> **UPDATE (profiled on K180 @ GB10, 2026-06-22): NOT WORTH IMPLEMENTING.**
+> The decode MoE breakdown (DS4_CUDA_MOE_PROFILE=1, 860 decode layer-launches)
+> is:
+> ```
+> gateup = 15.8 ms/token (74% of MoE)  -- bandwidth-bound, near the 97 GB/s floor
+> down   =  4.9 ms/token (23% of MoE)  -- only 5% of the ~104 ms decode
+> ```
+> `down` is 4.9 ms, not the large serial-expert cost the plan assumed. Even
+> halving it saves ~2.5 ms ≈ 2.4% decode. The warp-parallel rewrite is high
+> complexity for ~2% and risks output drift. **Skipped.** The serial-expert
+> prefetch from Opportunity #2 already warms all 6 down experts in parallel
+> (zero-risk, measured neutral — see below).
 
 ### Problem
 
@@ -151,6 +204,16 @@ opportunities 1 and 2.
 ## Opportunity 2 — Software prefetch in MoE gate/up kernel
 
 **Impact:** 5–15% (~5–15 ms/token). Easiest to implement.
+
+> **UPDATE (implemented 2026-06-22, measured NEUTRAL):** Prefetch preambles
+> added to `moe_gate_up_mid_decode_lut_nvfp4_kernel` and all three
+> `moe_down_sum6_*_qwarp32_kernel` variants. Decode at ~3500-token prompt:
+> 9.62 t/s median (3 runs) vs 9.65 without — within noise. On GB10 UMA the
+> managed pages are already device-resident (ReadMostly +
+> PreferredLocation=device), so the TLB-miss assumption behind the estimate
+> does not hold, and Blackwell's hardware L2 prefetcher is already aggressive.
+> Kept anyway: zero-risk, bit-identical, may help at longer contexts where the
+> expert working set shifts more.
 
 ### Problem
 
@@ -456,6 +519,15 @@ conditional complexity.
 
 **Impact:** <1% for current workloads. Only matters at extreme context lengths.
 
+> **UPDATE (profiled 2026-06-22): REVISED UP.** Attention is 23.8 ms/token (23%
+> of decode) at a ~3500-token prompt — the single biggest stage, not <1% as the
+> plan assumed. The turbo4-direct packed-read kernel is live; each of the 8
+> warps reads the same comp row independently from global memory. Shared-mem
+> staging of the current comp row (cooperative load once, all warps read from
+> smem) is now a clearer win than originally rated. Worth implementing next;
+> the cp.async double-buffer pattern already exists in the FP32
+> `attention_decode_mixed_heads8_online_kernel`.
+
 ### Problem
 
 The turbo4 direct attention kernel (`turbo4_attention.cuh`) reads each turbo4
@@ -638,23 +710,28 @@ writes logits to shared memory, then the same block does top-k selection. Saves
 
 ## Priority order
 
-| Priority | Opportunity | Impact | Effort | Risk |
-|----------|-------------|--------|--------|------|
-| 1 | **#2** Software prefetch in MoE | 5–15% | Easy | Zero (hint-only) |
-| 2 | **#4** Cache getenv/lookups | 3–5% | Easy | Zero |
-| 3 | **#8A** Fused norm+rope for Q | 1–2% | Trivial | Zero (kernel exists) |
-| 4 | **#1** MoE down expert parallelism | 10–20% | Medium | Output must match |
-| 5 | **#3** F16 matmul half2 loads | 5–10% | Medium | FP rounding |
-| 6 | **#7** Expert streaming buffer | ? | Easy-Med | May not help on UMA |
-| 7 | **#8B/C** More kernel fusion | 3–8% | Medium | FP rounding |
-| 8 | **#5** CUDA Graph capture | 2–5% | Hard | Complex, conditional branches |
-| 9 | **#6** Turbo4 shared mem staging | <1% | Easy | Only matters at 500K+ ctx |
+> **Revised 2026-06-22 after profiling.** Original estimates in parentheses.
 
-**Realistic combined target:** #1+#2+#3+#4+#8A = **~13–15 t/s at medium prompt**
-(1.4–1.6× current). The architectural ceiling without MTP is ~27 t/s (weight
-bandwidth floor + UMA contention). Closing the remaining gap requires
-eliminating all expert TLB overhead (#7 if it works) or MTP (amortizes weight
-load across multiple tokens).
+| Priority | Opportunity | Measured impact | Effort | Status |
+|----------|-------------|-----------------|--------|--------|
+| 1 | **#6** Turbo4 shared-mem staging | attention is 23.8 ms (23%) — biggest stage | Medium | **Next** |
+| 2 | **#5** CUDA Graph capture | 2–5% (launch/sync overhead) | Hard | Deferred (high effort, GPU-work-bound decode limits payoff) |
+| 3 | **#8B/C** More kernel fusion | 1–3% (launch + intermediate) | Medium | Low payoff given additive stage times |
+| 4 | **#1** MoE down expert-parallelism | ~2% (down is only 4.9 ms) | Medium | **Skipped** (not worth the complexity) |
+| 5 | **#7** Expert streaming buffer | ? | Easy-Med | Untested (UMA pages already device-resident → likely neutral like #2) |
+| — | **#2** Software prefetch | neutral | Easy | **Done** (kept, zero-risk) |
+| — | **#3** F16 __half2 loads | done | Medium | **Done** (in 9.65 t/s baseline) |
+| — | **#4** getenv cache | done | Easy | **Done** |
+| — | **#8A** Fused Q norm+rope | done | Trivial | **Done** |
+
+**Net result so far:** #2/#3/#4/#8A land at **9.65 t/s** vs 9.4 baseline (~2.7%
+at medium prompt). The plan's predicted ~13–15 t/s assumed #1 (10–20%) and #2
+(5–15%), both of which do not materialize on GB10 UMA (down is small; pages are
+already device-resident so prefetch/TLB tricks are neutral). The real remaining
+lever is **#6 (attention shared-mem staging)** on the 23.8 ms attention stage;
+**#5 (CUDA Graph)** is the structural win but high-effort and GPU-work-bound.
+Beyond that, MTP (amortizes weight load across multiple tokens) is the path to
+the ~27 t/s architectural ceiling.
 
 **When measuring:** always use the medium prompt (~3500 tokens) as the primary
 benchmark. Short-prompt numbers (12+ t/s) are misleading because they don't

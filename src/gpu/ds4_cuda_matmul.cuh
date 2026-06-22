@@ -59,7 +59,25 @@ __global__ static void matmul_f16_ordered_chunks_kernel(
     if (k1 > in_dim) k1 = in_dim;
     const __half *wr = w + row * in_dim;
     const float *xr = x + tok * in_dim;
-    for (uint64_t i = k0; i < k1; i++) {
+    /* Pair loads: __half2 for the F16 weights and float2 for the F32
+     * activation, which halves the number of load instructions.  Handles
+     * odd chunk boundaries by peeling a single element at each end. */
+    uint64_t kk0 = k0, kk1 = k1;
+    if ((kk0 & 1u) && kk0 < kk1) {
+        sum += __half2float(wr[kk0]) * xr[kk0];
+        kk0++;
+    }
+    const __half2 *wr2 = (const __half2 *)(wr + kk0);
+    const float2  *xr2 = (const float2  *)(xr + kk0);
+    const uint64_t n2 = (kk1 - kk0) / 2u;
+    for (uint64_t i = 0; i < n2; i++) {
+        float2 wf = __half22float2(wr2[i]);
+        float2 xf = xr2[i];
+        sum += wf.x * xf.x;
+        sum += wf.y * xf.y;
+    }
+    if ((kk1 - kk0) & 1u) {
+        uint64_t i = kk1 - 1u;
         sum += __half2float(wr[i]) * xr[i];
     }
     partial[tid] = sum;
@@ -94,7 +112,32 @@ __global__ static void matmul_f16_pair_ordered_chunks_kernel(
     if (k1 > in_dim) k1 = in_dim;
     const __half *wr0 = row < out0_dim ? w0 + row * in_dim : w0;
     const __half *wr1 = row < out1_dim ? w1 + row * in_dim : w1;
-    for (uint64_t i = k0; i < k1; i++) {
+    uint64_t kk0 = k0, kk1 = k1;
+    if ((kk0 & 1u) && kk0 < kk1) {
+        const float xv = x[kk0];
+        if (row < out0_dim) sum0 += __half2float(wr0[kk0]) * xv;
+        if (row < out1_dim) sum1 += __half2float(wr1[kk0]) * xv;
+        kk0++;
+    }
+    const __half2 *wr02 = (const __half2 *)(wr0 + kk0);
+    const __half2 *wr12 = (const __half2 *)(wr1 + kk0);
+    const float2  *xr2  = (const float2  *)(x + kk0);
+    const uint64_t n2 = (kk1 - kk0) / 2u;
+    for (uint64_t i = 0; i < n2; i++) {
+        float2 wf0 = __half22float2(wr02[i]);
+        float2 wf1 = __half22float2(wr12[i]);
+        float2 xf  = xr2[i];
+        if (row < out0_dim) {
+            sum0 += wf0.x * xf.x;
+            sum0 += wf0.y * xf.y;
+        }
+        if (row < out1_dim) {
+            sum1 += wf1.x * xf.x;
+            sum1 += wf1.y * xf.y;
+        }
+    }
+    if ((kk1 - kk0) & 1u) {
+        uint64_t i = kk1 - 1u;
         const float xv = x[i];
         if (row < out0_dim) sum0 += __half2float(wr0[i]) * xv;
         if (row < out1_dim) sum1 += __half2float(wr1[i]) * xv;

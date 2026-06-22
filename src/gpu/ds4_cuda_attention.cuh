@@ -1299,3 +1299,5 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
         out4[lane + 96u] = o3;
     }
 }
+
+#include "turbo4_attention.cuh"

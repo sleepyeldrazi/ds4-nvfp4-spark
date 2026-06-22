@@ -1695,13 +1695,16 @@ static bool gpu_graph_encode_decode_layer(
         }
 
         n_comp = g->layer_n_comp[il];
-        /* Turbo4 direct (packed-attention) kernel is not yet implemented:
-         * ds4_gpu_attention_indexed_mixed_batch_heads_turbo4_tensor is a stub.
-         * Force the fallback unpack-to-scratch path until the packed-read
-         * attention kernel is real. */
-        (void)(g->turbo_packv4 && n_comp != 0 && comp_selected != NULL &&
-               n_selected != 0 && g->layer_attn_comp_tq_cache[il] != NULL);
-        comp_cache_turbo4_direct = false;
+        /* Turbo4 direct: reads packed turbo4 KV directly in the attention
+         * kernel (e4m3 nope + e8m0 scale + BF16 rope), avoiding the FP32
+         * unpack-to-scratch intermediate step. Falls back to the unpack path
+         * if turbo4 is not enabled or any prerequisite is missing. */
+        comp_cache_turbo4_direct = g->turbo_packv4 &&
+            n_comp != 0 &&
+            comp_selected != NULL &&
+            n_selected != 0 &&
+            g->layer_attn_comp_tq_cache[il] != NULL &&
+            getenv("DS4_NO_TURBO4_DIRECT") == NULL;
         comp_cache = n_comp != 0
             ? (comp_cache_turbo4_direct
                 ? g->layer_attn_comp_tq_cache[il]

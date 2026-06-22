@@ -1599,17 +1599,45 @@ extern "C" void ds4_gpu_set_quality(bool quality) {
 #include "ds4_cuda_moe_dispatch.cuh"
 #include "ds4_cuda_dispatch4.cuh"
 
-/* Temporary stub for the turbo4 attention kernel — not yet implemented.
- * Returns 0 (not supported) so ds4 falls back to the FP32 attention path.
- * This will be replaced with a real packed-FP8-reading attention kernel. */
+/* turbo4 packed-attention dispatch: indexed mixed, reads comp_kv from
+ * turbo4-packed format (e4m3 nope + e8m0 scale + BF16 rope). Raw KV is FP32.
+ * Replaces the stub that returned 0 — now launches the real kernel. */
 extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_turbo4_tensor(
         ds4_gpu_tensor *heads, const void *mm, uint64_t ms, uint64_t soff,
         const ds4_gpu_tensor *q, const ds4_gpu_tensor *rkv, const ds4_gpu_tensor *ckv,
         const ds4_gpu_tensor *tk, uint32_t nt, uint32_t p0, uint32_t nr,
         uint32_t rc, uint32_t rs, uint32_t nc, uint32_t t_k, uint32_t w,
-        uint32_t ratio, uint32_t nh, uint32_t hd) {
-    (void)heads; (void)mm; (void)ms; (void)soff; (void)q; (void)rkv; (void)ckv;
-    (void)tk; (void)nt; (void)p0; (void)nr; (void)rc; (void)rs; (void)nc;
-    (void)t_k; (void)w; (void)ratio; (void)nh; (void)hd;
-    return 0;  /* not supported — caller falls back to FP32 path */
+        uint32_t ratio, uint32_t nh, uint32_t hd)
+{
+    /* Parameter validation (same as FP32 version, minus comp_kv FP32 size check) */
+    if (!heads || !q || !rkv || !ckv || !tk || !mm ||
+        nt == 0 || nr == 0 || rc < nr || rs >= rc ||
+        nc == 0 || t_k == 0 ||
+        soff > ms ||
+        (uint64_t)nh * sizeof(float) > ms - soff ||
+        heads->bytes < (uint64_t)nt * nh * hd * sizeof(float) ||
+        q->bytes < (uint64_t)nt * nh * hd * sizeof(float) ||
+        rkv->bytes < (uint64_t)rc * hd * sizeof(float) ||
+        tk->bytes < (uint64_t)nt * t_k * sizeof(int32_t)) {
+        return 0;
+    }
+    if (t_k > 512u) return 0;
+    const float *sinks = (const float *)cuda_model_range_ptr(
+            mm, soff, (uint64_t)nh * sizeof(float), "attn_sinks");
+    if (!sinks) return 0;
+
+    /* Launch kernel: 8 heads per block, 256 threads (4 warps). */
+    if (nt == 1 && hd == 512) {
+        dim3 grid(1, (nh + 7u) / 8u, 1);
+        attention_indexed_mixed_heads8_online_turbo4_kernel<<<grid, 256>>>(
+                (float *)heads->ptr, sinks, (const float *)q->ptr,
+                (const float *)rkv->ptr,
+                (const uint8_t *)ckv->ptr, (const int32_t *)tk->ptr,
+                nt, p0, nr, rc, rs, nc, t_k, w, ratio, nh, hd);
+        return cuda_ok(cudaGetLastError(), "attention turbo4 indexed online");
+    }
+
+    /* Fallback for non-standard configs (shouldn't happen for DS4 decode). */
+    (void)ratio; (void)w; (void)nh; (void)hd; (void)nc;
+    return 0;
 }

@@ -78,7 +78,9 @@ Always benchmark at the same prompt length before/after a change.
 
 Decode is **bandwidth-bound, not compute-bound** — the GPU draws ~33 W at 96%
 utilization. Planned optimizations (MoE down expert-parallelism, software
-prefetch, CUDA Graph capture, kernel fusion) target ~13–15 t/s without MTP.
+prefetch, CUDA Graph capture, kernel fusion) target ~13–15 t/s. MTP is planned
+as future work but requires retraining the draft heads to match the REAP-pruned
+expert set (the current un-pruned MTP heads produce garbage at K128/K150/K180).
 
 ## GB10 bandwidth & quant analysis
 
@@ -108,9 +110,11 @@ The 273 GB/s spec is physically unreachable for real workloads. The honest ceili
 **Key insight**: IQ2_XXS is dequant-compute-bound at 58 GB/s. NVFP4 reads *more*
 bytes (4.5 vs 2.06 bpw) but runs at 140 GB/s — the `__dp4a` kernel already beats
 IQ2_XXS **2.4×** on the expert path. The hybrid recipe (NVFP4 gate/up + Q2_K
-down) is the optimal decode mix: NVFP4 replaces the bottleneck, and Q2_K (160
-GB/s, near ceiling) is already fast enough for down experts. Q8_0 at 228 GB/s
-saturates the memory controller and is kept for attention/shared/head tensors.
+down) is the optimal decode mix: NVFP4 matches or beats the raw speed of
+IQ2_XXS-level quants while delivering **far better precision** (4.5 bpw vs 2.06
+bpw), and Q2_K (160 GB/s, near ceiling) is already fast enough for down experts.
+Q8_0 at 228 GB/s saturates the memory controller and is kept for
+attention/shared/head tensors.
 
 ## Usage
 
@@ -129,11 +133,11 @@ Builds three binaries:
 ```bash
 # K180 at full 1M context (recommended flags)
 DS4_CUDA_MANAGED_MODEL=1 DS4_KV_TURBO=1 \
-  ./ds4 -m hybrid-K180.gguf -p "Your prompt" --nothink --ctx 1048576
+  ./ds4 -m hybrid-K180.gguf -p "Your prompt" --ctx 1048576
 
 # K128 / K150 can load without managed mode, but it's still recommended
 DS4_CUDA_MANAGED_MODEL=1 DS4_KV_TURBO=1 \
-  ./ds4 -m hybrid-K128.gguf -p "Your prompt" --nothink
+  ./ds4 -m hybrid-K128.gguf -p "Your prompt"
 ```
 
 > **K180 requires `DS4_CUDA_MANAGED_MODEL=1`.** At 98.6 GiB the model does not
@@ -172,7 +176,7 @@ make
 # Quick correctness check
 DS4_CUDA_MANAGED_MODEL=1 DS4_KV_TURBO=1 \
   ./ds4 -m ../DeepSeek-V4-Flash-REAP-K180-hybrid.gguf \
-  -p "What is 2+2? Answer in one word." -n 8 --nothink --ctx 1048576
+  -p "What is 2+2? Answer in one word." -n 8 --ctx 1048576
 ```
 
 `verify.sh` runs math + coherence + factual checks; `bench.sh` is the

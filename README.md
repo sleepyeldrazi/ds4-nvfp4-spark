@@ -1,5 +1,10 @@
 # ds4 — NVFP4 hybrid serving on DGX Spark (GB10)
 
+> **⚠️ This GitHub repository is for archival / mirror purposes only.**
+> Active development happens at
+> **[git.kokoham.com/sleepy/ds4-nvfp4-spark](https://git.kokoham.com/sleepy/ds4-nvfp4-spark)**.
+> Please file issues, PRs, and check for updates there.
+
 Forked from [antirez/ds4](https://github.com/antirez/ds4), a standalone DeepSeek-V4
 Flash (~162B) inference engine (C + CUDA, no GGML dependency). This fork adds
 **NVFP4 expert quantization**, a **managed-memory serving path** for GB10 unified
@@ -176,6 +181,16 @@ DS4_CUDA_MANAGED_MODEL=1 DS4_KV_TURBO=1 \
 `verify.sh` runs math + coherence + factual checks; `bench.sh` is the
 reproducible throughput harness (drops OS caches, 3 runs + median). Both target
 K180 with the managed + turbo flags.
+
+## Models
+
+Pre-built hybrid GGUF models (NVFP4 + Q2_K, REAP-pruned) on HuggingFace:
+
+| REAP plan | HuggingFace |
+|---|---|
+| K128 | [sleepyeldrazi/DeepSeek-V4-Flash-REAP-K128-NVFP4](https://huggingface.co/sleepyeldrazi/DeepSeek-V4-Flash-REAP-K128-NVFP4) |
+| K150 | [sleepyeldrazi/DeepSeek-V4-Flash-REAP-K150-NVFP4](https://huggingface.co/sleepyeldrazi/DeepSeek-V4-Flash-REAP-K150-NVFP4) |
+| K180 | [sleepyeldrazi/DeepSeek-V4-Flash-REAP-K180-NVFP4](https://huggingface.co/sleepyeldrazi/DeepSeek-V4-Flash-REAP-K180-NVFP4) |
 
 ## Acknowledgements
 

@@ -354,6 +354,24 @@ __global__ static void moe_gate_up_mid_decode_lut_nvfp4_kernel(
         __syncthreads();
         xqb = sxq;
     }
+    /* Software prefetch: warm L2 for this block's first weight rows before
+     * the compute loop. On the 75 GB managed address space the first access
+     * to each expert's weight row is a cold L2 + TLB miss; issuing
+     * prefetch.global.L2 back-to-back (no compute between issues) fills the
+     * L2 miss queue faster than the compute loop would, priming the hardware
+     * prefetcher. Safe hint: no-op if the line is already resident. */
+    {
+        const uint32_t base = blockIdx.x * 128u;
+        for (uint32_t rr = 0; rr < 4u; rr++) {
+            uint32_t row = base + rr * 32u + row_lane;
+            if (row < expert_mid_dim) {
+                const char *gp = gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes;
+                const char *up_ = up_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes;
+                asm volatile("prefetch.global.L2 [%0];" :: "l"(gp));
+                asm volatile("prefetch.global.L2 [%0];" :: "l"(up_));
+            }
+        }
+    }
     for (uint32_t rr = 0; rr < 4u; rr++) {
         uint32_t row = blockIdx.x * 128u + row_lane + rr * 32u;
         if (row >= expert_mid_dim) continue;
@@ -1240,6 +1258,14 @@ __global__ static void moe_down_sum6_qwarp32_kernel(
     uint32_t lane = threadIdx.x & 7u;
     uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
     if (row >= out_dim) return;
+    /* Prefetch the first cache line of each of the 6 selected experts'
+     * down-projection weight row before the serial slot loop (Q2_K variant). */
+    for (uint32_t slot = 0; slot < 6u; slot++) {
+        int32_t expert_i = selected[slot];
+        if (expert_i < 0) expert_i = 0;
+        const char *wp = down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes;
+        asm volatile("prefetch.global.L2 [%0];" :: "l"(wp));
+    }
     float total = 0.0f;
     #pragma unroll
     for (uint32_t slot = 0; slot < 6u; slot++) {
@@ -1271,6 +1297,16 @@ __global__ static void moe_down_sum6_nvfp4_qwarp32_kernel(
     uint32_t lane = threadIdx.x & 7u;
     uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
     if (row >= out_dim) return;
+    /* Prefetch the first cache line of each of the 6 selected experts'
+     * down-projection weight row before the serial slot loop. The 6 experts'
+     * weights (~4.7 MB each) do not co-reside in the 24 MB L2, so warming
+     * them in parallel lets the L2 miss queue overlap the 6 miss bursts. */
+    for (uint32_t slot = 0; slot < 6u; slot++) {
+        int32_t expert_i = selected[slot];
+        if (expert_i < 0) expert_i = 0;
+        const char *wp = down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes;
+        asm volatile("prefetch.global.L2 [%0];" :: "l"(wp));
+    }
     float total = 0.0f;
     #pragma unroll
     for (uint32_t slot = 0; slot < 6u; slot++) {
@@ -1298,6 +1334,14 @@ __global__ static void moe_down_q4K_sum6_qwarp32_kernel(
     uint32_t lane = threadIdx.x & 7u;
     uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
     if (row >= out_dim) return;
+    /* Prefetch the first cache line of each of the 6 selected experts'
+     * down-projection weight row before the serial slot loop (Q4_K variant). */
+    for (uint32_t slot = 0; slot < 6u; slot++) {
+        int32_t expert_i = selected[slot];
+        if (expert_i < 0) expert_i = 0;
+        const char *wp = down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes;
+        asm volatile("prefetch.global.L2 [%0];" :: "l"(wp));
+    }
     float total = 0.0f;
     #pragma unroll
     for (uint32_t slot = 0; slot < 6u; slot++) {

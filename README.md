@@ -1,4 +1,4 @@
-# ds4 - Mixed NVFP4 serving of DeepSeek V4 Flash on DGX Spark (GB10)
+# ds4 - Mixed NVFP4 serving of DeepSeek V4 Flash on the NVIDIA Spark family (GB10)
 
 > **⚠️ This GitHub repository is for archival / mirror purposes only.**
 > Active development happens at
@@ -9,7 +9,13 @@ Forked from [antirez/ds4](https://github.com/antirez/ds4), a standalone DeepSeek
 Flash (~162B) inference engine (C + CUDA, no GGML dependency). This fork adds
 **NVFP4 expert quantization**, a **managed-memory serving path** for GB10 unified
 memory, the **lossless MXFP4→NVFP4 GGUF emission** pipeline, an **FP8-packed KV
-cache**, and **REAP expert pruning** to fit the model on a single 128 GB Spark.
+cache**, and **REAP expert pruning** to fit the model on a single 128 GB device.
+
+Targeted at the DGX Spark desktop and designed to be **day-one ready** for the
+upcoming [RTX Spark](https://www.nvidia.com/en-us/products/rtx-spark/) lineup
+(laptops, mini PCs, workstations from ASUS, Dell, HP, Lenovo, Microsoft, MSI,
+and others, shipping fall 2026). All devices share the same GB10 Grace Blackwell
+superchip so this engine should work across the whole family out of the box.
 
 Inspired by [eouya2/ds4-for-reaped](https://github.com/eouya2/ds4-for-reaped) and
 the [0xSero/DeepSeek-V4-Flash-162B-GGUF](https://huggingface.co/0xSero/DeepSeek-V4-Flash-162B-GGUF)
@@ -18,7 +24,7 @@ release.
 ## What this fork adds
 
 - **REAP expert pruning** (K128 / K150 / K180): selects top-K routed experts per
-  layer by FP4/FP8 REAP score, shrinking the model to fit on a 128 GB Spark while
+  layer by FP4/FP8 REAP score, shrinking the model to fit on a 128 GB device while
   preserving quality.
 - **NVFP4 expert quantization**: lossless MXFP4→NVFP4 repack with custom `__dp4a`
   decode kernels (~140 GB/s on GB10), replacing the dequant-bound IQ2_XXS path.
@@ -42,7 +48,7 @@ Pre-built hybrid GGUF models (NVFP4 gate/up + Q2_K down, REAP-pruned) on Hugging
 K150 and K180 models are uploaded following K128 (one at a time). The K128 repo is
 the first available.
 
-## Memory budget on the 128 GB Spark
+## Memory budget (128 GB device)
 
 K180 at **full 1M context** (verified, `DS4_CUDA_MANAGED_MODEL=1 DS4_KV_TURBO=1`,
 both attention and indexer KV packed):
@@ -63,7 +69,7 @@ reclaims ~1.5 GiB more. KV savings scale linearly with context (attention:
 
 ## Performance
 
-Decode throughput on GB10 (sm_121), K180 hybrid, managed + turbo4, single Spark:
+Decode throughput on GB10 (sm_121a), K180 hybrid, managed + turbo4, single device:
 
 | prompt | prefill t/s | decode t/s |
 |---|---|---|
@@ -84,7 +90,7 @@ expert set (the current un-pruned MTP heads produce garbage at K128/K150/K180).
 
 ## GB10 bandwidth & quant analysis
 
-Measured on this DGX Spark (GB10, sm_121a, CUDA 13.2, 128 GB unified LPDDR5X).
+Measured on the DGX Spark (GB10, sm_121a, CUDA 13.2, 128 GB unified LPDDR5X).
 
 ### Hardware ceilings
 
@@ -141,7 +147,7 @@ DS4_CUDA_MANAGED_MODEL=1 DS4_KV_TURBO=1 \
 ```
 
 > **K180 requires `DS4_CUDA_MANAGED_MODEL=1`.** At 98.6 GiB the model does not
-> fit in any single non-managed allocation on the 128 GB Spark. The managed path
+> fit in any single non-managed allocation on 128 GB. The managed path
 > is the only way to load K180.
 
 ## Hybrid GGUF build pipeline

@@ -5,7 +5,11 @@ set -e
 cd "$(dirname "$0")"
 GEN="${1:-32}"
 CTX="${2:-256}"
-MODEL="../DeepSeek-V4-Flash-REAP-K128-hybrid.gguf"
+MODEL="../DeepSeek-V4-Flash-REAP-K180-hybrid.gguf"
+# K180 (98.6 GiB) requires the managed-memory path to load on the 128 GB Spark;
+# DS4_KV_TURBO packs both attention + indexer KV so large ctx fits.
+export DS4_CUDA_MANAGED_MODEL=1
+export DS4_KV_TURBO=1
 sync 2>/dev/null || true
 sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches' 2>/dev/null || true
 for i in 1 2 3; do

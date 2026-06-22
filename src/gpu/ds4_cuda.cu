@@ -5,6 +5,8 @@
 #include <mma.h>
 #include <cublas_v2.h>
 
+#include "ds4_env.h"
+
 #include <stdint.h>
 #include <errno.h>
 #include <limits.h>
@@ -467,18 +469,18 @@ static void cuda_q8_f16_cache_disable_after_failure(const char *what, uint64_t r
 static int cuda_q8_f16_cache_allowed(const char *label, uint64_t in_dim, uint64_t out_dim) {
     if (g_quality_mode) return 0;
     if (g_q8_f16_disabled_after_oom) return 0;
-    if (getenv("DS4_CUDA_NO_Q8_F16_CACHE") != NULL) return 0;
+    if (!DS4_ENV_BOOL("DS4_CUDA_NO_Q8_F16_CACHE")) return 0;
     if (cuda_q8_f16_cache_limit_bytes() == 0) return 0;
-    if (getenv("DS4_CUDA_Q8_F16_ALL") != NULL) return 1;
+    if (DS4_ENV_BOOL("DS4_CUDA_Q8_F16_ALL")) return 1;
     if (!label) return 0;
     if (strstr(label, "attn_output_a") != NULL ||
         strstr(label, "attn_output_b") != NULL ||
         strstr(label, "attention_output_a") != NULL ||
         strstr(label, "attention_output_b") != NULL) {
-        return getenv("DS4_CUDA_NO_ATTENTION_OUTPUT_F16_CACHE") == NULL;
+        return !DS4_ENV_BOOL("DS4_CUDA_NO_ATTENTION_OUTPUT_F16_CACHE");
     }
     if (strstr(label, "attn_q_b") != NULL) {
-        return getenv("DS4_CUDA_NO_ATTN_Q_B_F16_CACHE") == NULL;
+        return !DS4_ENV_BOOL("DS4_CUDA_NO_ATTN_Q_B_F16_CACHE");
     }
     if (strstr(label, "ffn_gate_shexp") != NULL ||
         strstr(label, "ffn_up_shexp") != NULL ||
@@ -489,7 +491,7 @@ static int cuda_q8_f16_cache_allowed(const char *label, uint64_t in_dim, uint64_
            (in_dim == 2048u && out_dim == 4096u) ||
            (in_dim == 4096u && out_dim == 1024u) ||
            (in_dim == 4096u && out_dim == 512u) ||
-           (getenv("DS4_CUDA_NO_ATTN_Q_B_F16_CACHE") == NULL &&
+           (!DS4_ENV_BOOL("DS4_CUDA_NO_ATTN_Q_B_F16_CACHE") &&
             in_dim == 1024u && out_dim == 32768u);
 }
 
@@ -502,25 +504,25 @@ static int cuda_q8_label_is_attention_output(const char *label) {
 }
 
 static int cuda_q8_use_dp4a(void) {
-    return getenv("DS4_CUDA_NO_Q8_DP4A") == NULL;
+    return !DS4_ENV_BOOL("DS4_CUDA_NO_Q8_DP4A");
 }
 
 static int cuda_q8_f16_preload_allowed(const char *label, uint64_t in_dim, uint64_t out_dim) {
     if (cuda_q8_label_is_attention_output(label) &&
-        getenv("DS4_CUDA_ATTENTION_OUTPUT_PRELOAD") == NULL &&
-        getenv("DS4_CUDA_Q8_F16_ALL") == NULL) {
+        !DS4_ENV_BOOL("DS4_CUDA_ATTENTION_OUTPUT_PRELOAD") &&
+        !DS4_ENV_BOOL("DS4_CUDA_Q8_F16_ALL")) {
         return 0;
     }
     return cuda_q8_f16_cache_allowed(label, in_dim, out_dim);
 }
 
 static int cuda_q8_f32_cache_allowed(const char *label, uint64_t in_dim, uint64_t out_dim) {
-    if (getenv("DS4_CUDA_NO_Q8_F32_CACHE") != NULL) return 0;
-    if (getenv("DS4_CUDA_Q8_F32_ALL") != NULL) return 1;
+    if (DS4_ENV_BOOL("DS4_CUDA_NO_Q8_F32_CACHE")) return 0;
+    if (DS4_ENV_BOOL("DS4_CUDA_Q8_F32_ALL")) return 1;
     if (label && strstr(label, "attn_q_b") != NULL) {
-        return getenv("DS4_CUDA_ATTN_Q_B_F32_CACHE") != NULL;
+        return DS4_ENV_BOOL("DS4_CUDA_ATTN_Q_B_F32_CACHE");
     }
-    return getenv("DS4_CUDA_Q8_F32_LARGE") != NULL &&
+    return DS4_ENV_BOOL("DS4_CUDA_Q8_F32_LARGE") &&
            in_dim == 1024u && out_dim == 32768u;
 }
 

@@ -595,17 +595,17 @@ static bool gpu_graph_apply_directional_steering_ffn(
  */
 
 static bool gpu_graph_debug_wants(const char *name, uint32_t il, uint32_t pos) {
-    const char *prefix = getenv("DS4_GPU_GRAPH_DUMP_PREFIX");
+    const char *prefix = DS4_ENV_STR("DS4_GPU_GRAPH_DUMP_PREFIX");
     if (!prefix || !prefix[0]) return false;
 
-    const char *name_env = getenv("DS4_GPU_GRAPH_DUMP_NAME");
+    const char *name_env = DS4_ENV_STR("DS4_GPU_GRAPH_DUMP_NAME");
     if (name_env && name_env[0] && strstr(name_env, name) == NULL) return false;
 
-    const char *layer_env = getenv("DS4_GPU_GRAPH_DUMP_LAYER");
+    const char *layer_env = DS4_ENV_STR("DS4_GPU_GRAPH_DUMP_LAYER");
     if (layer_env && layer_env[0] && strcmp(layer_env, "all") != 0 &&
         (uint32_t)strtoul(layer_env, NULL, 10) != il) return false;
 
-    const char *pos_env = getenv("DS4_GPU_GRAPH_DUMP_POS");
+    const char *pos_env = DS4_ENV_STR("DS4_GPU_GRAPH_DUMP_POS");
     if (pos_env && pos_env[0] && (uint32_t)strtoul(pos_env, NULL, 10) != pos) return false;
 
     return true;
@@ -617,7 +617,7 @@ static void gpu_graph_debug_dump_tensor(
         uint64_t          n_f32,
         uint32_t          il,
         uint32_t          pos) {
-    const char *prefix = getenv("DS4_GPU_GRAPH_DUMP_PREFIX");
+    const char *prefix = DS4_ENV_STR("DS4_GPU_GRAPH_DUMP_PREFIX");
     if (!t || n_f32 == 0 || !gpu_graph_debug_wants(name, il, pos)) return;
 
     if (ds4_gpu_synchronize() == 0) {
@@ -646,7 +646,7 @@ static void gpu_graph_debug_dump_i32_tensor(
         uint64_t          n_i32,
         uint32_t          il,
         uint32_t          pos) {
-    const char *prefix = getenv("DS4_GPU_GRAPH_DUMP_PREFIX");
+    const char *prefix = DS4_ENV_STR("DS4_GPU_GRAPH_DUMP_PREFIX");
     if (!t || n_i32 == 0 || !gpu_graph_debug_wants(name, il, pos)) return;
 
     if (ds4_gpu_synchronize() == 0) {
@@ -1286,7 +1286,7 @@ static bool gpu_graph_encode_decode_layer(
     const bool qkv_rms_fused = !gpu_graph_use_reference_qkv_norm();
 
     bool ok = true;
-    const bool decode_stage_profile = getenv("DS4_GPU_DECODE_STAGE_PROFILE") != NULL;
+    const bool decode_stage_profile = DS4_ENV_BOOL("DS4_GPU_DECODE_STAGE_PROFILE");
     double decode_stage_t0 = decode_stage_profile ? now_sec() : 0.0;
 #define DS4_GPU_PROFILE_DECODE_STAGE(name) do { \
         if (ok && decode_stage_profile) { \
@@ -1388,15 +1388,11 @@ static bool gpu_graph_encode_decode_layer(
     if (ok) {
         gpu_graph_debug_dump_tensor("Qraw", g->q, q_dim, il, pos);
     }
-    if (ok) ok = ds4_gpu_head_rms_norm_tensor(g->q, 1, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_RMS_EPS) != 0;
-    if (ok) {
-        gpu_graph_debug_dump_tensor("Qnorm", g->q, q_dim, il, pos);
-    }
-    if (ok) ok = ds4_gpu_rope_tail_tensor(g->q, 1, DS4_N_HEAD, DS4_N_HEAD_DIM,
-                                            DS4_N_ROT, pos,
-                                            compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
-                                            false, freq_base, freq_scale, ext_factor, attn_factor,
-                                            DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW) != 0;
+    if (ok) ok = ds4_gpu_head_rms_norm_rope_tail_tensor(
+            g->q, 1, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT, pos,
+            compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
+            false, freq_base, freq_scale, ext_factor, attn_factor,
+            DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW, DS4_RMS_EPS) != 0;
     DS4_GPU_PROFILE_DECODE_STAGE("q_path");
     if (ok) {
         gpu_graph_debug_dump_tensor("Qcur", g->q, q_dim, il, pos);
@@ -1440,7 +1436,7 @@ static bool gpu_graph_encode_decode_layer(
     uint32_t n_selected = 0;
     bool comp_cache_turbo4_direct = false;
     double decode_index_stage_t0 = 0.0;
-    const bool decode_index_stage_profile = getenv("DS4_GPU_INDEXER_STAGE_PROFILE") != NULL;
+    const bool decode_index_stage_profile = DS4_ENV_BOOL("DS4_GPU_INDEXER_STAGE_PROFILE");
     if (ok && compressed) {
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         const uint32_t coff = ratio == 4 ? 2u : 1u;
@@ -1704,7 +1700,7 @@ static bool gpu_graph_encode_decode_layer(
             comp_selected != NULL &&
             n_selected != 0 &&
             g->layer_attn_comp_tq_cache[il] != NULL &&
-            getenv("DS4_NO_TURBO4_DIRECT") == NULL;
+            !DS4_ENV_BOOL("DS4_NO_TURBO4_DIRECT");
         comp_cache = n_comp != 0
             ? (comp_cache_turbo4_direct
                 ? g->layer_attn_comp_tq_cache[il]
@@ -1986,7 +1982,7 @@ static bool gpu_graph_encode_decode_layer(
     }
     const bool fuse_shared_gate_up =
         !g->quality &&
-        getenv("DS4_GPU_DISABLE_SHARED_GATE_UP_SWIGLU_FUSION") == NULL;
+        !DS4_ENV_BOOL("DS4_GPU_DISABLE_SHARED_GATE_UP_SWIGLU_FUSION");
     if (ok && fuse_shared_gate_up) {
         ok = ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(g->shared_gate,
                                                          g->shared_up,
@@ -2774,11 +2770,11 @@ static int gpu_graph_first_token_full_test(
 
     ds4_gpu_graph g;
     bool ok = gpu_graph_alloc(&g, weights, &weights->layer[0]);
-    const bool trace_layers = getenv("DS4_GPU_GRAPH_TRACE_LAYERS") != NULL;
+    const bool trace_layers = DS4_ENV_BOOL("DS4_GPU_GRAPH_TRACE_LAYERS");
     if (trace_layers && ok) {
         g.materialize_ffn_out = true;
-        const bool teacher_force = getenv("DS4_GPU_GRAPH_TEACHER_FORCE") != NULL;
-        const char *stage_layer_env = getenv("DS4_GPU_GRAPH_TRACE_STAGE_LAYER");
+        const bool teacher_force = DS4_ENV_BOOL("DS4_GPU_GRAPH_TEACHER_FORCE");
+        const char *stage_layer_env = DS4_ENV_STR("DS4_GPU_GRAPH_TRACE_STAGE_LAYER");
         const long stage_layer = stage_layer_env ? strtol(stage_layer_env, NULL, 10) : -1;
         float *plain = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
         float *cpu_cur = xmalloc((size_t)hc_dim * sizeof(float));
@@ -2934,7 +2930,7 @@ static bool gpu_graph_encode_token_raw_swa(
      * starving the second command buffer.
      */
     uint32_t split_after_layers = 4;
-    const char *split_env = getenv("DS4_GPU_GRAPH_TOKEN_SPLIT_LAYERS");
+    const char *split_env = DS4_ENV_STR("DS4_GPU_GRAPH_TOKEN_SPLIT_LAYERS");
     if (split_env && split_env[0]) {
         char *end = NULL;
         unsigned long v = strtoul(split_env, &end, 10);
@@ -3109,7 +3105,7 @@ static bool gpu_graph_upload_prompt_embeddings_hc(
     if (pos0 > (uint32_t)prompt->len || n_tokens > (uint32_t)prompt->len - pos0) return false;
 
     uint32_t gpu_min = 512;
-    const char *gpu_min_env = getenv("DS4_GPU_GPU_BATCH_EMBED_MIN");
+    const char *gpu_min_env = DS4_ENV_STR("DS4_GPU_GPU_BATCH_EMBED_MIN");
     if (gpu_min_env && gpu_min_env[0]) {
         char *end = NULL;
         unsigned long v = strtoul(gpu_min_env, &end, 10);
@@ -3142,7 +3138,7 @@ static bool gpu_graph_warmup_prefill_kernels(
         const ds4_weights *weights,
         uint32_t           n_tokens) {
     static bool warmed = false;
-    if (warmed || getenv("DS4_GPU_NO_PREFILL_KERNEL_WARMUP") != NULL) return true;
+    if (warmed || DS4_ENV_BOOL("DS4_GPU_NO_PREFILL_KERNEL_WARMUP")) return true;
 
     /*
      * The first batched F16 matmul can pay GPU's one-time pipeline execution
@@ -3264,9 +3260,9 @@ static bool gpu_graph_encode_layer_attention_batch(
     const uint32_t ratio = ds4_layer_compress_ratio(il);
     const bool compressed = ratio != 0;
     const bool zero_prefix = pos0 == 0;
-    const bool index_stage_profile = getenv("DS4_GPU_INDEXER_STAGE_PROFILE") != NULL;
-    const bool layer_stage_profile = getenv("DS4_GPU_LAYER_STAGE_PROFILE") != NULL;
-    const bool q_stage_profile = getenv("DS4_GPU_Q_STAGE_PROFILE") != NULL;
+    const bool index_stage_profile = DS4_ENV_BOOL("DS4_GPU_INDEXER_STAGE_PROFILE");
+    const bool layer_stage_profile = DS4_ENV_BOOL("DS4_GPU_LAYER_STAGE_PROFILE");
+    const bool q_stage_profile = DS4_ENV_BOOL("DS4_GPU_Q_STAGE_PROFILE");
     double layer_stage_t0 = layer_stage_profile ? now_sec() : 0.0;
     double q_stage_t0 = q_stage_profile ? now_sec() : 0.0;
 #define DS4_GPU_PROFILE_ATTN_STAGE(name) do { \
@@ -4612,7 +4608,7 @@ static bool gpu_graph_encode_layer_ffn_batch(
     const uint64_t gate_expert_bytes = expert_mid_dim * gate_row_bytes;
     const uint64_t down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);
     const uint64_t down_expert_bytes = routed_out_dim * down_row_bytes;
-    const bool layer_stage_profile = getenv("DS4_GPU_LAYER_STAGE_PROFILE") != NULL;
+    const bool layer_stage_profile = DS4_ENV_BOOL("DS4_GPU_LAYER_STAGE_PROFILE");
     double layer_stage_t0 = layer_stage_profile ? now_sec() : 0.0;
 #define DS4_GPU_PROFILE_FFN_STAGE(name) do { \
         if (ok && layer_stage_profile) { \
@@ -4906,7 +4902,7 @@ static bool gpu_graph_eval_token_raw_swa(
         int                    token,
         uint32_t               pos,
         float                 *logits) {
-    const bool profile = getenv("DS4_GPU_GRAPH_TOKEN_PROFILE") != NULL;
+    const bool profile = DS4_ENV_BOOL("DS4_GPU_GRAPH_TOKEN_PROFILE");
     const double t0 = profile ? now_sec() : 0.0;
 
     bool ok = ds4_gpu_begin_commands() != 0;
@@ -5493,7 +5489,7 @@ static bool gpu_graph_prefill_layer_major(
 
     if (!gpu_graph_warmup_prefill_kernels(g, model, weights, (uint32_t)n_tokens)) return false;
 
-    const bool split_profile = getenv("DS4_GPU_GRAPH_PREFILL_SPLIT_PROFILE") != NULL;
+    const bool split_profile = DS4_ENV_BOOL("DS4_GPU_GRAPH_PREFILL_SPLIT_PROFILE");
     /*
      * A full long-prompt prefill can keep the GPU busy long enough for macOS
      * to watchdog WindowServer. Keep short prompts in one command buffer for
@@ -5501,7 +5497,7 @@ static bool gpu_graph_prefill_layer_major(
      * server gets regular scheduling points.
      */
     const bool split_commands = split_profile || n_tokens > 2048 || imatrix != NULL;
-    const bool profile = getenv("DS4_GPU_GRAPH_PREFILL_PROFILE") != NULL || split_profile;
+    const bool profile = DS4_ENV_BOOL("DS4_GPU_GRAPH_PREFILL_PROFILE") || split_profile;
     const double t0 = profile ? now_sec() : 0.0;
     double encode_s = 0.0;
     double execute_s = 0.0;
@@ -5531,7 +5527,7 @@ static bool gpu_graph_prefill_layer_major(
 
         const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
         uint32_t output_row = (uint32_t)n_tokens - 1u;
-        const char *output_row_env = getenv("DS4_GPU_GRAPH_OUTPUT_ROW");
+        const char *output_row_env = DS4_ENV_STR("DS4_GPU_GRAPH_OUTPUT_ROW");
         if (output_row_env && output_row_env[0]) {
             char *end = NULL;
             unsigned long v = strtoul(output_row_env, &end, 10);
@@ -5686,7 +5682,7 @@ static bool gpu_graph_prefill_layer_major(
 
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     uint32_t output_row = (uint32_t)n_tokens - 1u;
-    const char *output_row_env = getenv("DS4_GPU_GRAPH_OUTPUT_ROW");
+    const char *output_row_env = DS4_ENV_STR("DS4_GPU_GRAPH_OUTPUT_ROW");
     if (output_row_env && output_row_env[0]) {
         char *end = NULL;
         unsigned long v = strtoul(output_row_env, &end, 10);
@@ -5812,7 +5808,7 @@ static bool gpu_graph_prefill_chunked_range(
     }
     if (!gpu_graph_warmup_prefill_kernels(g, model, weights, first_chunk)) return false;
 
-    const bool profile = getenv("DS4_GPU_GRAPH_PREFILL_PROFILE") != NULL;
+    const bool profile = DS4_ENV_BOOL("DS4_GPU_GRAPH_PREFILL_PROFILE");
     const double t0 = profile ? now_sec() : 0.0;
     double encode_s = 0.0;
     double execute_s = 0.0;
@@ -6218,7 +6214,7 @@ static uint32_t gpu_graph_raw_cap_for_context(int ctx_size, uint32_t prefill_cap
     uint32_t raw_cap = (uint32_t)wanted;
     if (raw_cap < raw_window) raw_cap = raw_window;
 
-    const char *env = getenv("DS4_GPU_GRAPH_RAW_CAP");
+    const char *env = DS4_ENV_STR("DS4_GPU_GRAPH_RAW_CAP");
     if (env && env[0]) {
         char *endp = NULL;
         const long v = strtol(env, &endp, 10);
@@ -6243,7 +6239,7 @@ static uint32_t gpu_graph_prefill_cap_for_prompt(int prompt_len) {
  * the KV cache with batched prefill instead of single-token decode.  The env
  * knob is useful while tuning the crossover point for different Macs. */
 static uint32_t gpu_graph_resume_prefill_min_tokens(void) {
-    const char *env = getenv("DS4_GPU_RESUME_PREFILL_MIN");
+    const char *env = DS4_ENV_STR("DS4_GPU_RESUME_PREFILL_MIN");
     if (env && env[0]) {
         char *endp = NULL;
         const long v = strtol(env, &endp, 10);
@@ -6346,7 +6342,7 @@ static int gpu_graph_prompt_logits_test(
         const token_vec   *prompt,
         int                ctx_size) {
     int n_test = prompt->len;
-    const char *n_test_env = getenv("DS4_GPU_GRAPH_PROMPT_TOKENS");
+    const char *n_test_env = DS4_ENV_STR("DS4_GPU_GRAPH_PROMPT_TOKENS");
     if (n_test_env && n_test_env[0]) {
         char *endp = NULL;
         const long v = strtol(n_test_env, &endp, 10);
@@ -6368,7 +6364,7 @@ static int gpu_graph_prompt_logits_test(
         fprintf(stderr, "ds4: failed to initialize GPU graph prompt test runtime\n");
         return 1;
     }
-    const bool memory_report = getenv("DS4_GPU_MEMORY_REPORT") != NULL;
+    const bool memory_report = DS4_ENV_BOOL("DS4_GPU_MEMORY_REPORT");
     if (memory_report) ds4_gpu_print_memory_report("after graph alloc");
 
     ds4_kv_cache cpu_cache;
@@ -6377,7 +6373,7 @@ static int gpu_graph_prompt_logits_test(
     float *gpu_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
     float *oracle_logits = NULL;
 
-    const char *oracle_path = getenv("DS4_ORACLE_LOGITS");
+    const char *oracle_path = DS4_ENV_STR("DS4_ORACLE_LOGITS");
     if (oracle_path && oracle_path[0]) {
         oracle_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
         if (!read_f32_binary_file(oracle_path, oracle_logits, DS4_N_VOCAB)) {
@@ -6399,20 +6395,20 @@ static int gpu_graph_prompt_logits_test(
     if (memory_report) ds4_gpu_print_memory_report("after prompt graph");
 
     if (ok) {
-        const char *dump_gpu = getenv("DS4_GPU_GRAPH_DUMP_LOGITS");
+        const char *dump_gpu = DS4_ENV_STR("DS4_GPU_GRAPH_DUMP_LOGITS");
         if (dump_gpu && dump_gpu[0]) {
             if (write_f32_binary_file(dump_gpu, gpu_logits, DS4_N_VOCAB)) {
                 fprintf(stderr, "ds4: wrote GPU graph logits to %s\n", dump_gpu);
             }
         }
-        const char *dump_cpu = getenv("DS4_CPU_DUMP_LOGITS");
+        const char *dump_cpu = DS4_ENV_STR("DS4_CPU_DUMP_LOGITS");
         if (dump_cpu && dump_cpu[0]) {
             if (write_f32_binary_file(dump_cpu, cpu_logits, DS4_N_VOCAB)) {
                 fprintf(stderr, "ds4: wrote CPU logits to %s\n", dump_cpu);
             }
         }
-        if (getenv("DS4_GPU_GRAPH_TRACE_CACHE") != NULL ||
-            getenv("DS4_GPU_GRAPH_TRACE_COMP") != NULL) {
+        if (DS4_ENV_BOOL("DS4_GPU_GRAPH_TRACE_CACHE") ||
+            DS4_ENV_BOOL("DS4_GPU_GRAPH_TRACE_COMP")) {
             for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
                 const uint32_t n_raw = cpu_cache.layer[il].n_raw;
                 if (n_raw != 0) {

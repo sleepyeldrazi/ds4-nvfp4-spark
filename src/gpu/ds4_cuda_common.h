@@ -7,6 +7,8 @@
 #include <mma.h>
 #include <cublas_v2.h>
 
+#include "ds4_env.h"
+
 #include <stdint.h>
 #include <errno.h>
 #include <limits.h>

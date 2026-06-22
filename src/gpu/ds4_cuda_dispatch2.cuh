@@ -45,7 +45,7 @@ extern "C" int ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(
         uint32_t                kv_n,
         uint32_t                rows,
         float                   eps) {
-    if (getenv("DS4_CUDA_DISABLE_QKV_RMS_FUSED") == NULL) {
+    if (!DS4_ENV_BOOL("DS4_CUDA_DISABLE_QKV_RMS_FUSED")) {
         if (!q_out || !q || !kv_out || !kv || !model_map ||
             q_weight_offset > model_size ||
             kv_weight_offset > model_size ||
@@ -528,7 +528,7 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
     if (!sinks) return 0;
     if (!cuda_attention_score_buffer_fits(n_comp)) {
         if (!use_mask && head_dim == 512u &&
-            getenv("DS4_CUDA_NO_WINDOW_ATTENTION") == NULL) {
+            !DS4_ENV_BOOL("DS4_CUDA_NO_WINDOW_ATTENTION")) {
             dim3 online_grid(1, (n_head + 7u) / 8u, 1);
             attention_decode_mixed_heads8_online_kernel<<<online_grid, 256>>>((float *)heads->ptr,
                                                                               sinks,
@@ -573,8 +573,8 @@ extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(ds4_gpu_tensor *heads,
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
     if (n_tokens > 1 && head_dim == 512 &&
-        getenv("DS4_CUDA_NO_WINDOW_ATTENTION") == NULL &&
-        (getenv("DS4_CUDA_WINDOW_ATTENTION") != NULL || (!g_quality_mode && n_tokens >= 128u))) {
+        !DS4_ENV_BOOL("DS4_CUDA_NO_WINDOW_ATTENTION") &&
+        (DS4_ENV_BOOL("DS4_CUDA_WINDOW_ATTENTION") || (!g_quality_mode && n_tokens >= 128u))) {
         dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
         attention_static_mixed_heads8_online_kernel<<<grid, 256>>>((float *)heads->ptr,
                                                                    sinks,
@@ -590,7 +590,7 @@ extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(ds4_gpu_tensor *heads,
         return cuda_ok(cudaGetLastError(), "attention raw window launch");
     }
     if (g_cublas_ready && n_tokens > 1 && head_dim == 512 &&
-        getenv("DS4_CUDA_NO_CUBLAS_ATTENTION") == NULL) {
+        !DS4_ENV_BOOL("DS4_CUDA_NO_CUBLAS_ATTENTION")) {
         const uint32_t n_keys = n_tokens;
         const uint64_t score_count = (uint64_t)n_head * n_tokens * n_keys;
         const uint64_t out_count = (uint64_t)n_head * n_tokens * head_dim;
@@ -699,7 +699,7 @@ static int attention_decode_batch_launch(
     if (!sinks) return 0;
     if (!cuda_attention_score_buffer_fits(n_comp)) {
         if (!use_comp_mask && head_dim == 512u &&
-            getenv("DS4_CUDA_NO_WINDOW_ATTENTION") == NULL) {
+            !DS4_ENV_BOOL("DS4_CUDA_NO_WINDOW_ATTENTION")) {
             dim3 online_grid(n_tokens, (n_head + 7u) / 8u, 1);
             attention_decode_mixed_heads8_online_kernel<<<online_grid, 256>>>((float *)heads->ptr,
                                                                               sinks,
@@ -722,8 +722,8 @@ static int attention_decode_batch_launch(
         return 0;
     }
     if (!use_comp_mask && n_tokens > 1 && head_dim == 512 &&
-        getenv("DS4_CUDA_NO_WINDOW_ATTENTION") == NULL &&
-        (getenv("DS4_CUDA_WINDOW_ATTENTION") != NULL || (!g_quality_mode && n_tokens >= 128u))) {
+        !DS4_ENV_BOOL("DS4_CUDA_NO_WINDOW_ATTENTION") &&
+        (DS4_ENV_BOOL("DS4_CUDA_WINDOW_ATTENTION") || (!g_quality_mode && n_tokens >= 128u))) {
         dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
         attention_decode_mixed_heads8_online_kernel<<<grid, 256>>>((float *)heads->ptr,
                                                                    sinks,
@@ -838,9 +838,9 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
     if (n_tokens > 1 && head_dim == 512 && top_k <= 512u &&
-        getenv("DS4_CUDA_NO_INDEXED_HEADS8") == NULL) {
+        !DS4_ENV_BOOL("DS4_CUDA_NO_INDEXED_HEADS8")) {
         dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
-        if (getenv("DS4_CUDA_INDEXED_TWOPASS") == NULL) {
+        if (!DS4_ENV_BOOL("DS4_CUDA_INDEXED_TWOPASS")) {
             attention_indexed_mixed_heads8_online_kernel<<<grid, 256>>>((float *)heads->ptr,
                                                                         sinks,
                                                                         (const float *)q->ptr,
@@ -931,8 +931,8 @@ static int attention_prefill_mixed_launch(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
     if (!use_comp_mask && n_tokens > 1 && head_dim == 512 &&
-        getenv("DS4_CUDA_NO_WINDOW_ATTENTION") == NULL &&
-        (getenv("DS4_CUDA_WINDOW_ATTENTION") != NULL || (!g_quality_mode && n_tokens >= 128u))) {
+        !DS4_ENV_BOOL("DS4_CUDA_NO_WINDOW_ATTENTION") &&
+        (DS4_ENV_BOOL("DS4_CUDA_WINDOW_ATTENTION") || (!g_quality_mode && n_tokens >= 128u))) {
         dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
         attention_static_mixed_heads8_online_kernel<<<grid, 256>>>((float *)heads->ptr,
                                                                    sinks,
@@ -948,7 +948,7 @@ static int attention_prefill_mixed_launch(
         return cuda_ok(cudaGetLastError(), "attention mixed window launch");
     }
     if (g_cublas_ready && n_tokens > 1 && head_dim == 512 &&
-        getenv("DS4_CUDA_NO_CUBLAS_ATTENTION") == NULL) {
+        !DS4_ENV_BOOL("DS4_CUDA_NO_CUBLAS_ATTENTION")) {
         const uint32_t n_keys = n_tokens + n_comp;
         const uint64_t kv_count = (uint64_t)n_keys * head_dim;
         const uint64_t score_count = (uint64_t)n_head * n_tokens * n_keys;
@@ -1133,7 +1133,7 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
     if (!g_quality_mode &&
         g_cublas_ready &&
         n_tokens >= out_a_cublas_min_tokens &&
-        getenv("DS4_CUDA_NO_CUBLAS_ATTENTION_OUTPUT_A") == NULL) {
+        !DS4_ENV_BOOL("DS4_CUDA_NO_CUBLAS_ATTENTION_OUTPUT_A")) {
         out_a_f16 = cuda_q8_f16_ptr(model_map, out_a_offset, out_a_bytes, group_dim, low_dim, "attn_output_a");
     }
     if (out_a_f16) {

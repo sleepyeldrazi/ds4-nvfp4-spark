@@ -115,7 +115,7 @@ extern "C" int ds4_gpu_hc_split_weighted_sum_norm_tensor(
         uint32_t                sinkhorn_iters,
         float                   eps,
         float                   norm_eps) {
-    if (getenv("DS4_CUDA_DISABLE_HC_SPLIT_NORM_FUSED") == NULL) {
+    if (!DS4_ENV_BOOL("DS4_CUDA_DISABLE_HC_SPLIT_NORM_FUSED")) {
         if (!out || !norm_out || !split || !mix || !residual_hc || !model_map ||
             n_embd == 0 || n_hc != 4) {
             return 0;
@@ -259,7 +259,7 @@ extern "C" int ds4_gpu_shared_down_hc_expand_q8_0_tensor(
         const ds4_gpu_tensor *split,
         uint32_t                n_embd,
         uint32_t                n_hc) {
-    if (getenv("DS4_CUDA_DISABLE_Q8_HC_EXPAND_FUSED") == NULL) {
+    if (!DS4_ENV_BOOL("DS4_CUDA_DISABLE_Q8_HC_EXPAND_FUSED")) {
         return cuda_matmul_q8_0_hc_expand_tensor_labeled(out_hc, shared_out,
                                                         model_map, model_size,
                                                         weight_offset,
@@ -291,7 +291,7 @@ extern "C" int ds4_gpu_matmul_q8_0_hc_expand_tensor(
         const ds4_gpu_tensor *split,
         uint32_t                n_embd,
         uint32_t                n_hc) {
-    if (getenv("DS4_CUDA_DISABLE_Q8_HC_EXPAND_FUSED") == NULL) {
+    if (!DS4_ENV_BOOL("DS4_CUDA_DISABLE_Q8_HC_EXPAND_FUSED")) {
         return cuda_matmul_q8_0_hc_expand_tensor_labeled(out_hc, block_out,
                                                         model_map, model_size,
                                                         weight_offset,

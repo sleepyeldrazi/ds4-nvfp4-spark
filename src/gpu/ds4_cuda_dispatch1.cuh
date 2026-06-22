@@ -63,7 +63,7 @@ static int indexer_scores_launch(
     }
     if (causal && ratio == 0) return 0;
     if (n_tokens == 1u && head_dim == 128u && n_head == 64u &&
-        getenv("DS4_CUDA_NO_INDEXER_DIRECT_ONE") == NULL) {
+        !DS4_ENV_BOOL("DS4_CUDA_NO_INDEXER_DIRECT_ONE")) {
         indexer_score_one_direct_kernel<<<n_comp, 128>>>((float *)scores->ptr,
                                                          (const float *)q->ptr,
                                                          (const float *)weights->ptr,
@@ -73,7 +73,7 @@ static int indexer_scores_launch(
         return cuda_ok(cudaGetLastError(), "indexer score one direct launch");
     }
     if (!g_quality_mode && head_dim == 128u && n_head == 64u &&
-        getenv("DS4_CUDA_NO_INDEXER_WMMA") == NULL) {
+        !DS4_ENV_BOOL("DS4_CUDA_NO_INDEXER_WMMA")) {
         dim3 grid((n_comp + 15u) / 16u, (n_tokens + 15u) / 16u, 1);
         indexer_scores_wmma_kernel<<<grid, 32>>>((float *)scores->ptr,
                                                  (const float *)q->ptr,
@@ -150,28 +150,28 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
         return 0;
     }
     if (top_k == 512u && n_comp <= 1024u &&
-        getenv("DS4_CUDA_NO_TOPK1024") == NULL) {
+        !DS4_ENV_BOOL("DS4_CUDA_NO_TOPK1024")) {
         indexer_topk_1024_kernel<<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
                                                      (const float *)scores->ptr,
                                                      n_comp, n_tokens, top_k);
         return cuda_ok(cudaGetLastError(), "indexer topk 1024 launch");
     }
     if (top_k == 512u && n_comp <= 2048u &&
-        getenv("DS4_CUDA_NO_TOPK2048") == NULL) {
+        !DS4_ENV_BOOL("DS4_CUDA_NO_TOPK2048")) {
         indexer_topk_pow2_kernel<2048><<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
                                                            (const float *)scores->ptr,
                                                            n_comp, n_tokens, top_k);
         return cuda_ok(cudaGetLastError(), "indexer topk 2048 launch");
     }
     if (top_k == 512u && n_comp <= 4096u &&
-        getenv("DS4_CUDA_NO_TOPK2048") == NULL) {
+        !DS4_ENV_BOOL("DS4_CUDA_NO_TOPK2048")) {
         indexer_topk_pow2_kernel<4096><<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
                                                            (const float *)scores->ptr,
                                                            n_comp, n_tokens, top_k);
         return cuda_ok(cudaGetLastError(), "indexer topk 4096 launch");
     }
-    if (top_k == 512u && getenv("DS4_CUDA_NO_TOPK2048") == NULL &&
-        getenv("DS4_CUDA_NO_TOPK_CHUNKED") == NULL) {
+    if (top_k == 512u && !DS4_ENV_BOOL("DS4_CUDA_NO_TOPK2048") &&
+        !DS4_ENV_BOOL("DS4_CUDA_NO_TOPK_CHUNKED")) {
         const uint32_t chunk_n = 4096u;
         const uint32_t n_chunks = (n_comp + chunk_n - 1u) / chunk_n;
         const uint32_t candidate_stride = n_chunks * top_k;
@@ -346,7 +346,7 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
                 use_dp4a);
         return cuda_ok(cudaGetLastError(), "matmul_q8_0 warp launch");
     }
-    if (getenv("DS4_CUDA_NO_Q8_BATCH_WARP") == NULL && blocks <= 32u) {
+    if (!DS4_ENV_BOOL("DS4_CUDA_NO_Q8_BATCH_WARP") && blocks <= 32u) {
         dim3 bgrid(((unsigned)out_dim + 7u) / 8u, (unsigned)n_tok, 1);
         matmul_q8_0_preq_batch_warp8_kernel<<<bgrid, 256>>>(
                 (float *)out->ptr,
@@ -518,17 +518,17 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "f16");
     if (!wptr) return 0;
     const __half *w = (const __half *)wptr;
-    const int serial_f16 = getenv("DS4_CUDA_SERIAL_F16_MATMUL") != NULL;
+    const int serial_f16 = DS4_ENV_BOOL("DS4_CUDA_SERIAL_F16_MATMUL");
     const int router_shape = in_dim == 4096u && out_dim == 256u && n_tok == 1u;
     const int serial_router =
         !serial_f16 &&
         router_shape &&
-        getenv("DS4_CUDA_SERIAL_ROUTER") != NULL;
+        DS4_ENV_BOOL("DS4_CUDA_SERIAL_ROUTER");
     const int ordered_router =
         !serial_f16 &&
         !serial_router &&
         n_tok == 1u &&
-        getenv("DS4_CUDA_NO_ORDERED_F16_MATMUL") == NULL;
+        !DS4_ENV_BOOL("DS4_CUDA_NO_ORDERED_F16_MATMUL");
     if (!serial_f16 && g_cublas_ready && n_tok > 1) {
         const uint64_t xh_count = n_tok * in_dim;
         __half *xh = (__half *)cuda_tmp_alloc(xh_count * sizeof(__half), "f16 gemm activations");
@@ -586,10 +586,10 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
         return 0;
     }
     if (n_tok != 1 ||
-        getenv("DS4_CUDA_NO_F16_PAIR_MATMUL") != NULL ||
-        getenv("DS4_CUDA_SERIAL_F16_MATMUL") != NULL ||
-        getenv("DS4_CUDA_SERIAL_ROUTER") != NULL ||
-        getenv("DS4_CUDA_NO_ORDERED_F16_MATMUL") != NULL) {
+        DS4_ENV_BOOL("DS4_CUDA_NO_F16_PAIR_MATMUL") ||
+        DS4_ENV_BOOL("DS4_CUDA_SERIAL_F16_MATMUL") ||
+        DS4_ENV_BOOL("DS4_CUDA_SERIAL_ROUTER") ||
+        DS4_ENV_BOOL("DS4_CUDA_NO_ORDERED_F16_MATMUL")) {
         return ds4_gpu_matmul_f16_tensor(out0, model_map, model_size, weight0_offset,
                                            in_dim, out_dim, x, n_tok) &&
                ds4_gpu_matmul_f16_tensor(out1, model_map, model_size, weight1_offset,

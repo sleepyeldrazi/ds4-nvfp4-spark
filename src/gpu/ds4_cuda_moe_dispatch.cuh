@@ -93,7 +93,7 @@ static int routed_moe_launch(
     if (down->bytes >= xq_bytes && gate->bytes >= midq_bytes) {
         cuda_block_q8_K *xq = (cuda_block_q8_K *)down->ptr;
         cuda_block_q8_K *midq = (cuda_block_q8_K *)gate->ptr;
-        const uint32_t profile_moe = getenv("DS4_CUDA_MOE_PROFILE") != NULL;
+        const uint32_t profile_moe = DS4_ENV_BOOL("DS4_CUDA_MOE_PROFILE");
         cudaEvent_t prof_ev[7] = {NULL, NULL, NULL, NULL, NULL, NULL, NULL};
         if (profile_moe) {
             for (uint32_t i = 0; i < 7u; i++) {
@@ -107,47 +107,47 @@ static int routed_moe_launch(
         }
         const uint32_t pair_count = n_tokens * n_expert;
         const uint32_t use_sorted_pairs = n_tokens > 1u;
-        const uint32_t use_expert_tiles = use_sorted_pairs && getenv("DS4_CUDA_MOE_NO_EXPERT_TILES") == NULL;
-        const uint32_t expert_tile_m = getenv("DS4_CUDA_MOE_TILE4") ? 4u : 8u;
-        const uint32_t write_gate_up = getenv("DS4_CUDA_MOE_WRITE_GATE_UP") != NULL;
-        const uint32_t use_p2_sorted = use_sorted_pairs && getenv("DS4_CUDA_MOE_NO_P2") == NULL;
+        const uint32_t use_expert_tiles = use_sorted_pairs && !DS4_ENV_BOOL("DS4_CUDA_MOE_NO_EXPERT_TILES");
+        const uint32_t expert_tile_m = DS4_ENV_BOOL("DS4_CUDA_MOE_TILE4") ? 4u : 8u;
+        const uint32_t write_gate_up = DS4_ENV_BOOL("DS4_CUDA_MOE_WRITE_GATE_UP");
+        const uint32_t use_p2_sorted = use_sorted_pairs && !DS4_ENV_BOOL("DS4_CUDA_MOE_NO_P2");
         const uint32_t use_atomic_down = use_expert_tiles &&
-            (getenv("DS4_CUDA_MOE_ATOMIC_DOWN") != NULL ||
-             (n_tokens >= 128u && getenv("DS4_CUDA_MOE_NO_ATOMIC_DOWN") == NULL));
+            (DS4_ENV_BOOL("DS4_CUDA_MOE_ATOMIC_DOWN") ||
+             (n_tokens >= 128u && !DS4_ENV_BOOL("DS4_CUDA_MOE_NO_ATOMIC_DOWN")));
         const uint32_t use_gate_row2048 = use_expert_tiles && expert_tile_m == 8u &&
-            (getenv("DS4_CUDA_MOE_GATE_ROW2048") != NULL ||
-             getenv("DS4_CUDA_MOE_GATE_ROW256") != NULL ||
-             getenv("DS4_CUDA_MOE_GATE_ROW128") != NULL ||
+            (DS4_ENV_BOOL("DS4_CUDA_MOE_GATE_ROW2048") ||
+             DS4_ENV_BOOL("DS4_CUDA_MOE_GATE_ROW256") ||
+             DS4_ENV_BOOL("DS4_CUDA_MOE_GATE_ROW128") ||
              (n_tokens >= 128u &&
-              getenv("DS4_CUDA_MOE_NO_GATE_ROW2048") == NULL &&
-              getenv("DS4_CUDA_MOE_NO_GATE_ROW256") == NULL &&
-              getenv("DS4_CUDA_MOE_NO_GATE_ROW128") == NULL));
+              !DS4_ENV_BOOL("DS4_CUDA_MOE_NO_GATE_ROW2048") &&
+              !DS4_ENV_BOOL("DS4_CUDA_MOE_NO_GATE_ROW256") &&
+              !DS4_ENV_BOOL("DS4_CUDA_MOE_NO_GATE_ROW128")));
         const uint32_t use_down_tile16 = use_atomic_down && expert_tile_m == 8u &&
-            n_tokens >= 128u && getenv("DS4_CUDA_MOE_NO_DOWN_TILE16") == NULL;
+            n_tokens >= 128u && !DS4_ENV_BOOL("DS4_CUDA_MOE_NO_DOWN_TILE16");
         const uint32_t use_down_block16 = use_down_tile16 && midq_blocks <= 8u &&
-            getenv("DS4_CUDA_MOE_NO_DOWN_BLOCK16") == NULL;
+            !DS4_ENV_BOOL("DS4_CUDA_MOE_NO_DOWN_BLOCK16");
         const uint32_t use_decode_lut_gate =
             n_tokens == 1u && xq_blocks <= 16u &&
-            getenv("DS4_CUDA_MOE_NO_DECODE_LUT_GATE") == NULL;
+            !DS4_ENV_BOOL("DS4_CUDA_MOE_NO_DECODE_LUT_GATE");
         const uint32_t gate_row_span =
-            getenv("DS4_CUDA_MOE_GATE_ROW512") != NULL ? 512u :
-            getenv("DS4_CUDA_MOE_GATE_ROW2048") != NULL ? 2048u : 1024u;
+            DS4_ENV_BOOL("DS4_CUDA_MOE_GATE_ROW512") ? 512u :
+            DS4_ENV_BOOL("DS4_CUDA_MOE_GATE_ROW2048") ? 2048u : 1024u;
         const uint32_t down_row_span =
-            getenv("DS4_CUDA_MOE_DOWN_ROW512") != NULL ? 512u :
-            getenv("DS4_CUDA_MOE_DOWN_ROW1024") != NULL ? 1024u : 2048u;
+            DS4_ENV_BOOL("DS4_CUDA_MOE_DOWN_ROW512") ? 512u :
+            DS4_ENV_BOOL("DS4_CUDA_MOE_DOWN_ROW1024") ? 1024u : 2048u;
         const uint32_t use_down_row2048 = use_atomic_down && expert_tile_m == 8u &&
-            (getenv("DS4_CUDA_MOE_DOWN_ROW2048") != NULL ||
-             getenv("DS4_CUDA_MOE_DOWN_ROW256") != NULL ||
-             getenv("DS4_CUDA_MOE_DOWN_ROW128") != NULL ||
-             getenv("DS4_CUDA_MOE_DOWN_ROW64") != NULL ||
+            (DS4_ENV_BOOL("DS4_CUDA_MOE_DOWN_ROW2048") ||
+             DS4_ENV_BOOL("DS4_CUDA_MOE_DOWN_ROW256") ||
+             DS4_ENV_BOOL("DS4_CUDA_MOE_DOWN_ROW128") ||
+             DS4_ENV_BOOL("DS4_CUDA_MOE_DOWN_ROW64") ||
              (use_down_tile16 &&
-              getenv("DS4_CUDA_MOE_NO_DOWN_ROW2048") == NULL &&
-              getenv("DS4_CUDA_MOE_NO_DOWN_ROW256") == NULL &&
-              getenv("DS4_CUDA_MOE_NO_DOWN_ROW128") == NULL &&
-              getenv("DS4_CUDA_MOE_NO_DOWN_ROW64") == NULL));
+              !DS4_ENV_BOOL("DS4_CUDA_MOE_NO_DOWN_ROW2048") &&
+              !DS4_ENV_BOOL("DS4_CUDA_MOE_NO_DOWN_ROW256") &&
+              !DS4_ENV_BOOL("DS4_CUDA_MOE_NO_DOWN_ROW128") &&
+              !DS4_ENV_BOOL("DS4_CUDA_MOE_NO_DOWN_ROW64")));
         const uint32_t use_direct_down_sum6 =
             n_tokens == 1u && n_expert == 6u &&
-            getenv("DS4_CUDA_MOE_NO_DIRECT_DOWN_SUM6") == NULL;
+            !DS4_ENV_BOOL("DS4_CUDA_MOE_NO_DIRECT_DOWN_SUM6");
         uint32_t *sorted_pairs = NULL;
         uint32_t *sorted_offsets = NULL;
         uint32_t *sorted_counts = NULL;

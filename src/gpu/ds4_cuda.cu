@@ -1419,6 +1419,7 @@ extern "C" void ds4_gpu_destroy_stream(void *stream) {
 extern "C" int ds4_gpu_sync_stream(void *stream) {
     return cuda_ok(cudaStreamSynchronize((cudaStream_t)stream), "sync stream");
 }
+
 extern "C" int ds4_gpu_synchronize(void) { return cuda_ok(cudaDeviceSynchronize(), "synchronize"); }
 
 extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
@@ -1704,4 +1705,135 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_turbo4_tensor(
     /* Fallback for non-standard configs (shouldn't happen for DS4 decode). */
     (void)ratio; (void)w; (void)nh; (void)hd; (void)nc;
     return 0;
+}
+
+/* ========================================================================
+ * CUDA Graph dynamic-arg node update (decode-opt #5)
+ * ========================================================================
+ * After capturing the decode tape, we enumerate the graph's kernel nodes and
+ * identify those that take per-token dynamic args (pos, token, raw_row, n_raw,
+ * raw_start).  Before each replay we update those args via
+ * cudaGraphExecKernelNodeSetParams, then cudaGraphLaunch.  n_comp (per-layer,
+ * evolves every 4 tokens for ratio-4 layers) stays baked at capture time;
+ * the graph is recaptured every 4th token to pick up the new n_comp.
+ *
+ * Variable indices: 0=pos, 1=token, 2=raw_row, 3=n_raw, 4=raw_start. */
+
+struct dyn_arg_entry { int arg_idx; int var_idx; };
+
+struct dyn_node_info {
+    cudaGraphNode_t node;
+    int n_dyn;
+    dyn_arg_entry dyn[4];
+};
+
+#define DS4_MAX_DYN_NODES 4096
+struct ds4_graph_update_ctx {
+    cudaGraph_t graph;          /* kept alive for node queries */
+    dyn_node_info nodes[DS4_MAX_DYN_NODES];
+    int n_nodes;
+    uint32_t vars[5];           /* pos, token, raw_row, n_raw, raw_start */
+};
+
+/* Classify a kernel by its function pointer.  Returns the number of dynamic
+ * args (0 if the kernel doesn't need per-replay updates). */
+static int classify_dyn_kernel(void *func, dyn_arg_entry *out) {
+    if (func == (void *)embed_token_hc_kernel) {
+        out[0] = {2, 1};  return 1;             /* token */
+    }
+    if (func == (void *)head_rms_norm_rope_tail_kernel) {
+        out[0] = {5, 0};  return 1;            /* pos0 */
+    }
+    if (func == (void *)rope_tail_kernel) {
+        out[0] = {5, 0};  return 1;            /* pos0 */
+    }
+    if (func == (void *)store_raw_kv_batch_kernel) {
+        out[0] = {3, 2};  return 1;            /* pos0 = raw_row */
+    }
+    if (func == (void *)attention_indexed_mixed_heads8_online_turbo4_kernel) {
+        out[0] = {7, 0};  out[1] = {8, 3};  out[2] = {10, 4};  return 3;  /* pos0, n_raw, raw_start */
+    }
+    if (func == (void *)attention_indexed_mixed_heads8_online_kernel) {
+        out[0] = {7, 0};  out[1] = {8, 3};  out[2] = {10, 4};  return 3;
+    }
+    if (func == (void *)attention_decode_mixed_heads8_online_kernel) {
+        out[0] = {7, 3};  out[1] = {9, 4};  return 2;  /* n_raw, raw_start (pos0=0 const) */
+    }
+    if (func == (void *)attention_decode_mixed_kernel) {
+        out[0] = {9, 3};  out[1] = {11, 4};  return 2;
+    }
+    return 0;
+}
+
+extern "C" void *ds4_gpu_graph_build_updates(void *graph_handle) {
+    cudaGraph_t graph = (cudaGraph_t)graph_handle;
+    ds4_graph_update_ctx *ctx = new ds4_graph_update_ctx;
+    ctx->graph = graph;
+    ctx->n_nodes = 0;
+    memset(ctx->vars, 0, sizeof(ctx->vars));
+
+    size_t n_total = 0;
+    if (!cuda_ok(cudaGraphGetNodes(graph, NULL, &n_total), "graph get nodes count")) {
+        delete ctx;  return NULL;
+    }
+    if (n_total == 0) return (void *)ctx;
+    cudaGraphNode_t *all = new cudaGraphNode_t[n_total];
+    if (!cuda_ok(cudaGraphGetNodes(graph, all, &n_total), "graph get nodes")) {
+        delete[] all;  delete ctx;  return NULL;
+    }
+    for (size_t i = 0; i < n_total; i++) {
+        cudaGraphNodeType ntype;
+        if (cudaGraphNodeGetType(all[i], &ntype) != cudaSuccess) continue;
+        if (ntype != cudaGraphNodeTypeKernel) continue;
+        cudaKernelNodeParams kp;
+        if (cudaGraphKernelNodeGetParams(all[i], &kp) != cudaSuccess) continue;
+        dyn_arg_entry dyn[4];
+        int n_dyn = classify_dyn_kernel(kp.func, dyn);
+        if (n_dyn == 0) continue;
+        if (ctx->n_nodes >= DS4_MAX_DYN_NODES) break;
+        ctx->nodes[ctx->n_nodes].node = all[i];
+        ctx->nodes[ctx->n_nodes].n_dyn = n_dyn;
+        for (int j = 0; j < n_dyn; j++) ctx->nodes[ctx->n_nodes].dyn[j] = dyn[j];
+        ctx->n_nodes++;
+    }
+    delete[] all;
+    fprintf(stderr, "ds4: graph: %zu total nodes, %d dynamic-arg nodes\n", n_total, ctx->n_nodes);
+    return (void *)ctx;
+}
+
+extern "C" void ds4_gpu_graph_destroy_updates(void *ctx_handle) {
+    ds4_graph_update_ctx *ctx = (ds4_graph_update_ctx *)ctx_handle;
+    if (ctx) delete ctx;
+}
+
+extern "C" int ds4_gpu_graph_update_and_launch(
+        void *exec_handle, void *ctx_handle, void *stream_handle,
+        uint32_t pos, uint32_t token, uint32_t raw_row,
+        uint32_t n_raw, uint32_t raw_start) {
+    cudaGraphExec_t exec = (cudaGraphExec_t)exec_handle;
+    ds4_graph_update_ctx *ctx = (ds4_graph_update_ctx *)ctx_handle;
+    cudaStream_t stream = (cudaStream_t)stream_handle;
+    if (!exec || !ctx) return 0;
+    ctx->vars[0] = pos;
+    ctx->vars[1] = token;
+    ctx->vars[2] = raw_row;
+    ctx->vars[3] = n_raw;
+    ctx->vars[4] = raw_start;
+    for (int i = 0; i < ctx->n_nodes; i++) {
+        cudaKernelNodeParams kp;
+        if (cudaGraphKernelNodeGetParams(ctx->nodes[i].node, &kp) != cudaSuccess) {
+            fprintf(stderr, "ds4: graph update: GetParams failed at node %d\n", i);
+            return 0;
+        }
+        for (int j = 0; j < ctx->nodes[i].n_dyn; j++)
+            kp.kernelParams[ctx->nodes[i].dyn[j].arg_idx] =
+                (void *)&ctx->vars[ctx->nodes[i].dyn[j].var_idx];
+        cudaError_t err = cudaGraphExecKernelNodeSetParams(exec, ctx->nodes[i].node, &kp);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "ds4: graph update: SetParams failed at node %d: %s\n",
+                    i, cudaGetErrorString(err));
+            return 0;
+        }
+    }
+    return cuda_ok(cudaGraphLaunch(exec, stream), "graph launch");
 }

@@ -49,6 +49,16 @@ int ds4_gpu_instantiate_graph(void *graph, void **exec_out);
 int ds4_gpu_launch_graph(void *exec, void *stream);
 void ds4_gpu_destroy_exec(void *exec);
 void ds4_gpu_destroy_graph(void *graph);
+
+/* Graph dynamic-arg node update (decode-opt #5).  After capture, build an
+ * update context that identifies which kernel nodes take per-token dynamic
+ * args (pos, token, raw_row, n_raw, raw_start).  Before each replay, call
+ * update_and_launch to set the new arg values and launch in one call. */
+void *ds4_gpu_graph_build_updates(void *graph);
+void ds4_gpu_graph_destroy_updates(void *ctx);
+int ds4_gpu_graph_update_and_launch(void *exec, void *ctx, void *stream,
+        uint32_t pos, uint32_t token, uint32_t raw_row,
+        uint32_t n_raw, uint32_t raw_start);
 int ds4_gpu_synchronize(void);
 
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);

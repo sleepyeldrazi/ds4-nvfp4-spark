@@ -248,8 +248,11 @@ typedef struct {
      * 43-layer tape into a graph; subsequent tokens replay it with one
      * cudaGraphLaunch, eliminating the ~98ms CPU dispatch overhead. */
     void *graph_exec;      /* cudaGraphExec_t */
+    void *graph_obj;       /* cudaGraph_t (kept alive for node-param queries) */
+    void *graph_update_ctx;/* ds4_graph_update_ctx (dynamic-arg node table) */
     void *graph_capture_stream;  /* cudaStream_t (non-blocking, capturable) */
     int   graph_captured;       /* 0 = not yet captured, 1 = exec ready */
+    uint32_t graph_capture_pos; /* pos at which the current graph was captured */
 } ds4_gpu_graph;
 
 /* Release every GPU tensor owned by the whole-model graph runtime. */
@@ -343,6 +346,8 @@ static void gpu_graph_free(ds4_gpu_graph *g) {
     ds4_gpu_tensor_free(g->indexer_weights);
     ds4_gpu_tensor_free(g->indexer_q);
     ds4_gpu_destroy_exec(g->graph_exec);
+    ds4_gpu_destroy_graph(g->graph_obj);
+    ds4_gpu_graph_destroy_updates(g->graph_update_ctx);
     ds4_gpu_destroy_stream(g->graph_capture_stream);
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         ds4_gpu_tensor_free(g->layer_raw_cache[il]);
@@ -4924,54 +4929,100 @@ static bool gpu_graph_eval_token_raw_swa(
     const double t0 = profile ? now_sec() : 0.0;
 
     /* ---- CUDA Graph capture/replay path (decode-opt #5) ----
-     * First decode token captures the full 43-layer tape; subsequent tokens
-     * replay it with one cudaGraphLaunch, collapsing ~98ms CPU dispatch.
-     * NOTE: pos/token are currently baked into the graph.  This first proof
-     * replays the SAME pos/token — output will be wrong for different tokens
-     * until args-buffer variability is added.  Goal: verify capture works +
-     * measure replay speedup. */
+     * The decode tape is ~430 small kernel launches with ~98ms CPU dispatch
+     * and ~74ms GPU work.  Graph replay collapses the CPU dispatch into one
+     * cudaGraphLaunch (~0.3ms) + dynamic-arg node updates (~1ms).
+     *
+     * Strategy: capture at a non-emit pos, replay for subsequent non-emit
+     * tokens (3 of 4), manual dispatch at emit tokens (1 of 4, when the
+     * compressor emits and n_comp increments).  After each emit, recapture.
+     *
+     * Dynamic per-token args (pos, token, raw_row, n_raw, raw_start) are
+     * updated via cudaGraphExecKernelNodeSetParams before each replay.
+     * n_comp (per-layer, evolves at emit) is baked at capture time and stays
+     * correct between emits. */
     if (use_graph && logits) {
-        bool gok = true;
-        if (!g->graph_captured) {
-            if (!g->graph_capture_stream)
-                g->graph_capture_stream = ds4_gpu_create_stream();
-            if (!g->graph_capture_stream) { gok = false; }
-            if (gok) {
-                ds4_gpu_set_launch_stream(g->graph_capture_stream);
-                void *graph = NULL;
-                gok = ds4_gpu_begin_capture(g->graph_capture_stream) != 0;
-                if (gok) gok = gpu_graph_encode_token_raw_swa(g, model, weights,
-                                                                 token, pos, true, false);
-                if (gok) gok = ds4_gpu_end_capture(g->graph_capture_stream, &graph) != 0;
-                ds4_gpu_set_launch_stream(NULL);
-                if (gok && graph)
-                    gok = ds4_gpu_instantiate_graph(graph, &g->graph_exec) != 0;
-                if (graph) ds4_gpu_destroy_graph(graph);
-                if (gok && g->graph_exec) {
-                    g->graph_captured = 1;
-                    ds4_gpu_sync_stream(g->graph_capture_stream);
+        /* Emit check: ratio-4 layers emit when (pos+1)%4==0.  ratio-128 emits
+         * are a subset (128%4==0).  So this single check covers all layers. */
+        const bool is_emit_pos = ((pos + 1u) & 3u) == 0u;
+        const uint32_t raw_row = pos % g->raw_cap;
+        const uint32_t n_raw = gpu_graph_raw_span_for_batch(g, pos, 1);
+        const uint32_t raw_start = gpu_graph_raw_start_for_span(g, pos, n_raw);
+
+        if (is_emit_pos || !g->graph_captured) {
+            /* Emit token or first token: manual dispatch.  If non-emit,
+             * also capture a new graph for subsequent replays. */
+            if (!is_emit_pos) {
+                /* Non-emit, graph stale: capture a new graph.  The capture
+                 * records the 430 launches (CPU dispatch, ~5ms) then we
+                 * instantiate + launch to get logits. */
+                if (!g->graph_capture_stream)
+                    g->graph_capture_stream = ds4_gpu_create_stream();
+                if (g->graph_exec) { ds4_gpu_destroy_exec(g->graph_exec); g->graph_exec = NULL; }
+                if (g->graph_obj) { ds4_gpu_destroy_graph(g->graph_obj); g->graph_obj = NULL; }
+                if (g->graph_update_ctx) { ds4_gpu_graph_destroy_updates(g->graph_update_ctx); g->graph_update_ctx = NULL; }
+                g->graph_captured = 0;
+
+                if (g->graph_capture_stream) {
+                    ds4_gpu_set_launch_stream(g->graph_capture_stream);
+                    void *graph = NULL;
+                    bool cok = ds4_gpu_begin_capture(g->graph_capture_stream) != 0;
+                    if (cok) cok = gpu_graph_encode_token_raw_swa(g, model, weights,
+                                                                     token, pos, true, false);
+                    if (cok) cok = ds4_gpu_end_capture(g->graph_capture_stream, &graph) != 0;
+                    ds4_gpu_set_launch_stream(NULL);
+                    if (cok && graph) {
+                        cok = ds4_gpu_instantiate_graph(graph, &g->graph_exec) != 0;
+                        if (cok) g->graph_obj = graph;  /* keep graph for node queries */
+                        else ds4_gpu_destroy_graph(graph);
+                    }
+                    if (cok && g->graph_exec) {
+                        g->graph_update_ctx = ds4_gpu_graph_build_updates(g->graph_obj);
+                        g->graph_captured = 1;
+                        g->graph_capture_pos = pos;
+                    }
+                    if (cok && g->graph_captured) {
+                        /* Launch the captured graph to execute + get logits. */
+                        cok = ds4_gpu_graph_update_and_launch(
+                                g->graph_exec, g->graph_update_ctx,
+                                g->graph_capture_stream,
+                                pos, (uint32_t)token, raw_row, n_raw, raw_start) != 0;
+                        if (cok) cok = ds4_gpu_sync_stream(g->graph_capture_stream) != 0;
+                        if (cok) cok = ds4_gpu_tensor_read(g->logits, 0, logits,
+                                                            (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+                    }
+                    if (profile)
+                        fprintf(stderr, "ds4: GPU graph CAPTURE+LAUNCH pos=%u %.3f ms\n",
+                                pos, (now_sec() - t0) * 1000.0);
+                    if (cok) return true;
+                    fprintf(stderr, "ds4: GPU graph capture failed, falling back to manual\n");
+                    /* fall through to manual */
                 }
             }
-            if (gok) gok = ds4_gpu_tensor_read(g->logits, 0, logits,
-                                                 (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
-            if (profile)
-                fprintf(stderr, "ds4: GPU graph CAPTURE pos=%u %.3f ms\n",
-                        pos, (now_sec() - t0) * 1000.0);
-            if (gok) return true;
-            /* capture failed — fall through to manual path */
-            fprintf(stderr, "ds4: GPU graph capture failed, falling back to manual\n");
+            /* Emit token or capture failed: manual dispatch. */
+            if (g->graph_captured) {
+                /* Graph is now stale (n_comp changed at emit).  Destroy it. */
+                ds4_gpu_destroy_exec(g->graph_exec); g->graph_exec = NULL;
+                ds4_gpu_destroy_graph(g->graph_obj); g->graph_obj = NULL;
+                ds4_gpu_graph_destroy_updates(g->graph_update_ctx); g->graph_update_ctx = NULL;
+                g->graph_captured = 0;
+            }
+            /* Fall through to manual dispatch below. */
         } else {
-            ds4_gpu_set_launch_stream(g->graph_capture_stream);
-            gok = ds4_gpu_launch_graph(g->graph_exec, g->graph_capture_stream) != 0;
-            ds4_gpu_set_launch_stream(NULL);
-            if (gok) gok = ds4_gpu_sync_stream(g->graph_capture_stream) != 0;
-            if (gok) gok = ds4_gpu_tensor_read(g->logits, 0, logits,
-                                                 (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+            /* Non-emit token with valid graph: replay with updated args. */
+            bool rok = ds4_gpu_graph_update_and_launch(
+                    g->graph_exec, g->graph_update_ctx,
+                    g->graph_capture_stream,
+                    pos, (uint32_t)token, raw_row, n_raw, raw_start) != 0;
+            if (rok) rok = ds4_gpu_sync_stream(g->graph_capture_stream) != 0;
+            if (rok) rok = ds4_gpu_tensor_read(g->logits, 0, logits,
+                                                (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
             if (profile)
                 fprintf(stderr, "ds4: GPU graph REPLAY pos=%u %.3f ms\n",
                         pos, (now_sec() - t0) * 1000.0);
-            if (gok) return true;
+            if (rok) return true;
             fprintf(stderr, "ds4: GPU graph replay failed, falling back to manual\n");
+            /* fall through to manual */
         }
     }
 

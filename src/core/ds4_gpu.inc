@@ -253,6 +253,10 @@ typedef struct {
     void *graph_capture_stream;  /* cudaStream_t (non-blocking, capturable) */
     int   graph_captured;       /* 0 = not yet captured, 1 = exec ready */
     uint32_t graph_capture_pos; /* pos at which the current graph was captured */
+    uint32_t graph_session_pos; /* last token pos the graph was used at.  If the
+                                   next pos is not +1, a prefill has happened and
+                                   the graph must be recaptured (comp cache state
+                                   changed). */
 } ds4_gpu_graph;
 
 /* Release every GPU tensor owned by the whole-model graph runtime. */
@@ -4938,6 +4942,22 @@ static bool gpu_graph_eval_token_raw_swa(
         const uint32_t n_raw = gpu_graph_raw_span_for_batch(g, pos, 1);
         const uint32_t raw_start = gpu_graph_raw_start_for_span(g, pos, n_raw);
 
+        /* If a suffix prefill happened since the last graph use, the comp
+         * cache state has changed (new rows emitted).  Invalidate the graph
+         * so we recapture with the current state — this avoids illegal memory
+         * accesses from graph kernels reading stale tensor boundaries. */
+        if (g->graph_captured && g->graph_session_pos > 0 &&
+            pos != g->graph_session_pos + 1u) {
+            if (profile)
+                fprintf(stderr, "ds4: GPU graph INVALIDATE: prefill gap pos=%u prev=%u\n",
+                        pos, g->graph_session_pos);
+            ds4_gpu_destroy_exec(g->graph_exec); g->graph_exec = NULL;
+            ds4_gpu_destroy_graph(g->graph_obj); g->graph_obj = NULL;
+            ds4_gpu_graph_destroy_updates(g->graph_update_ctx);
+            g->graph_update_ctx = NULL;
+            g->graph_captured = 0;
+        }
+
         if (!g->graph_captured) {
             /* First token: capture the tape, instantiate, build update table,
              * then launch to get logits.  The captured graph is valid for all
@@ -4977,7 +4997,7 @@ static bool gpu_graph_eval_token_raw_swa(
                 if (profile)
                     fprintf(stderr, "ds4: GPU graph CAPTURE+LAUNCH pos=%u %.3f ms\n",
                             pos, (now_sec() - t0) * 1000.0);
-                if (cok) return true;
+                if (cok) { g->graph_session_pos = pos; return true; }
                 fprintf(stderr, "ds4: GPU graph capture failed, falling back to manual\n");
             }
             /* fall through to manual on failure */
@@ -4993,7 +5013,7 @@ static bool gpu_graph_eval_token_raw_swa(
             if (profile)
                 fprintf(stderr, "ds4: GPU graph REPLAY pos=%u %.3f ms\n",
                         pos, (now_sec() - t0) * 1000.0);
-            if (rok) return true;
+            if (rok) { g->graph_session_pos = pos; return true; }
             fprintf(stderr, "ds4: GPU graph replay failed, falling back to manual\n");
             /* fall through to manual */
         }

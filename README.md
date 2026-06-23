@@ -27,13 +27,17 @@ release.
   layer by FP4/FP8 REAP score, shrinking the model to fit on a 128 GB device while
   preserving quality.
 - **NVFP4 expert quantization**: lossless MXFP4→NVFP4 repack with custom `__dp4a`
-  decode kernels (~140 GB/s on GB10), replacing the dequant-bound IQ2_XXS path.
+  decode kernels (~140 GB/s on GB10). NVFP4 is slightly slower than the IQ2_XXS
+  path in practice (it reads more bytes per token), but delivers **far better
+  precision** (4.5 bpw vs 2.06 bpw).
 - **FP8-packed KV cache** (`DS4_KV_TURBO=1`): real packed FP8 storage matching the
   DS-V4 paper spec (3.5× compression over FP32), reclaiming ~7.2 GiB at 1M context.
   Both attention and indexer KV streams are packed.
 - **Managed-memory serving** (`DS4_CUDA_MANAGED_MODEL=1`): single-residency loading
-  via `cudaMallocManaged` + hints (~97 GB/s), enabling K180 to serve on the 128 GB
-  Spark without model duplication.
+  via `cudaMallocManaged` + hints. This avoids duplicating the model in RAM,
+  making K180 at 1M context fit, but costs **1-3 t/s** of decode throughput
+  compared to the default non-managed path. Use it when you need the RAM savings
+  (K180 requires it); K128 and K150 can skip it if top speed matters more.
 
 ## Models
 
@@ -114,13 +118,14 @@ The 273 GB/s spec is physically unreachable for real workloads. The honest ceili
 | **IQ2_XXS** | 2.06 | **`__dp4a`** | **58.6** | **dequant-compute ✗** |
 
 **Key insight**: IQ2_XXS is dequant-compute-bound at 58 GB/s. NVFP4 reads *more*
-bytes (4.5 vs 2.06 bpw) but runs at 140 GB/s - the `__dp4a` kernel already beats
-IQ2_XXS **2.4×** on the expert path. The hybrid recipe (NVFP4 gate/up + Q2_K
-down) is the optimal decode mix: NVFP4 matches or beats the raw speed of
-IQ2_XXS-level quants while delivering **far better precision** (4.5 bpw vs 2.06
-bpw), and Q2_K (160 GB/s, near ceiling) is already fast enough for down experts.
-Q8_0 at 228 GB/s saturates the memory controller and is kept for
-attention/shared/head tensors.
+bytes (4.5 vs 2.06 bpw) and its `__dp4a` kernel runs at 140 GB/s — fast for its
+bit-width, but the extra bytes make it **slightly slower end-to-end** than an
+IQ2_XXS-based build. The tradeoff is worth it: NVFP4 delivers **far better
+precision** (4.5 vs 2.06 bpw) at roughly similar speed. The hybrid recipe (NVFP4
+gate/up + Q2_K down) keeps down experts at the fast Q2_K quant (160 GB/s, near
+ceiling) while using NVFP4 only where the precision matters most. Q8_0 at 228
+GB/s saturates the memory controller and is kept for attention/shared/head
+tensors.
 
 ## Usage
 
@@ -141,14 +146,15 @@ Builds three binaries:
 DS4_CUDA_MANAGED_MODEL=1 DS4_KV_TURBO=1 \
   ./ds4 -m hybrid-K180.gguf -p "Your prompt" --ctx 1048576
 
-# K128 / K150 can load without managed mode, but it's still recommended
-DS4_CUDA_MANAGED_MODEL=1 DS4_KV_TURBO=1 \
-  ./ds4 -m hybrid-K128.gguf -p "Your prompt"
+# K128 / K150 can load without managed mode. Managed mode saves RAM but costs
+# 1-3 t/s - skip it on K128/K150 if you want maximum throughput:
+./ds4 -m hybrid-K128.gguf -p "Your prompt"
 ```
 
 > **K180 requires `DS4_CUDA_MANAGED_MODEL=1`.** At 98.6 GiB the model does not
 > fit in any single non-managed allocation on 128 GB. The managed path
-> is the only way to load K180.
+> is the only way to load K180, but it costs **1-3 t/s** vs non-managed loading
+> (which is only available on smaller models that fit without it).
 
 ## Hybrid GGUF build pipeline
 
@@ -233,12 +239,13 @@ in-place FP8 value quantization but wrote the result back into **FP32 buffers**
 
 ### Managed-memory serving
 
-GB10 has hardware ATS (`PageableMemAccessUsesHostPageTables=1`) - the GPU reads
-CPU-allocated memory directly, coherent, no copy. This fork loads the GGUF into
-a `cudaMallocManaged` buffer (via chunked `pread` + `posix_fadvise DONTNEED`)
-with `cudaMemAdvise(SetReadMostly + SetPreferredLocation=device)` +
-`cudaMemPrefetchAsync`, and gates off the redundant on-demand cudaMemcpy span
-cache. Result: single residency at ~97 GB/s.
+`DS4_CUDA_MANAGED_MODEL=1` avoids duplicating the model in RAM by loading into a
+`cudaMallocManaged` buffer with hints (`SetReadMostly + SetPreferredLocation=device`
++ `cudaMemPrefetchAsync`) instead of the default `mmap` path. This cuts RAM usage
+significantly (the model lives once instead of twice), but **costs 1-3 t/s**
+depending on context length: managed reads run at ~97 GB/s vs ~118 GB/s for the
+default path. It's required for K180 (the model doesn't fit otherwise) and
+optional for K128/K150.
 
 ### Bandwidth hierarchy (measured)
 

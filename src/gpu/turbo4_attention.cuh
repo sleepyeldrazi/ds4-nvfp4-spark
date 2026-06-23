@@ -4,7 +4,7 @@
  *
  * Reads raw_kv as FP32 and comp_kv as turbo4-packed format:
  *   [ n_nope e4m3 bytes | n_nope/64 e8m0 scales | 1 pad byte | n_rot BF16 ]
- * For DS4: 384 e4m3 + 6 e8m0 + 1 pad + 128 BF16 = 584 bytes/row (73×8).
+ * For DS4: 448 e4m3 + 7 e8m0 + 1 pad + 128 BF16 = 584 bytes/row (73×8).
  *
  * Each warp handles one head. Thread `lane` contributes 16 dims:
  *   q0 → dims lane*4 .. lane*4+3    (float4[lane+0])
@@ -13,8 +13,11 @@
  *   q3 → dims lane*4+384 .. +387    (float4[lane+96])
  * Warp sum (32 threads × 16 dims) = 512 dims.
  *
- * Single-read design: load KV elements once per row, reuse for score + output.
- * Shared memory: ~3 KB (raw_rows[256] + comp_rows[512] + counters).
+ * Cooperative dequant-to-shared (decode-opt #6): each turbo4 comp row is
+ * dequantized to FP32 in shared memory ONCE by the 256-thread block, then all
+ * 8 head-warps read the FP32 values from smem — replacing the previous 8×
+ * redundant per-warp _t4_elem dequant of the same row.
+ * Shared memory: ~5 KB (raw_rows[256] + comp_rows[512] + kv_smem[512] + ctrs).
  */
 
 /* ---- device helper: turbo4 packed-row stride ---- */
@@ -69,6 +72,7 @@ __global__ static void attention_indexed_mixed_heads8_online_turbo4_kernel(
     __shared__ uint32_t raw_count;
     __shared__ uint32_t raw_first_idx;
     __shared__ uint32_t comp_count;
+    __shared__ float    kv_smem[512];   /* cooperative dequant of one comp row */
 
     uint32_t qpos = pos0 + t;
     uint32_t first_raw_pos = pos0 + n_tokens - n_raw;
@@ -134,6 +138,18 @@ __global__ static void attention_indexed_mixed_heads8_online_turbo4_kernel(
 
     /* ---- process each row once ---- */
     for (uint32_t sr = 0; sr < n_score; sr++) {
+        /* Cooperative dequant for comp rows: all 256 threads dequant the
+         * turbo4 row into kv_smem once, replacing the 8x redundant per-warp
+         * _t4_elem path.  Placed before the valid_head check so every thread
+         * reaches the __syncthreads below — no divergence deadlock. */
+        if (sr >= raw_count) {
+            uint32_t ci = comp_rows[sr - raw_count];
+            const uint8_t *row = comp_kv + ci * rstride;
+            for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x)
+                kv_smem[d] = _t4_elem(row, d, head_dim, n_rot);
+        }
+        __syncthreads();
+
         if (!valid_head) continue;
 
         /* --- load 16 KV elements into registers --- */
@@ -158,28 +174,27 @@ __global__ static void attention_indexed_mixed_heads8_online_turbo4_kernel(
                  + q2.x*kv2  + q2.y*kv2y + q2.z*kv2z + q2.w*kv2w
                  + q3.x*kv3  + q3.y*kv3y + q3.z*kv3z + q3.w*kv3w;
         } else {
-            uint32_t ci = comp_rows[sr - raw_count];
-            const uint8_t *row = comp_kv + ci * rstride;
+            /* Comp row: read dequantized FP32 from shared memory. */
             uint32_t d0 = lane * 4u;
-            kv0  = _t4_elem(row, d0,       head_dim, n_rot);
-            kv0y = _t4_elem(row, d0 + 1u,  head_dim, n_rot);
-            kv0z = _t4_elem(row, d0 + 2u,  head_dim, n_rot);
-            kv0w = _t4_elem(row, d0 + 3u,  head_dim, n_rot);
+            kv0  = kv_smem[d0];
+            kv0y = kv_smem[d0 + 1u];
+            kv0z = kv_smem[d0 + 2u];
+            kv0w = kv_smem[d0 + 3u];
             uint32_t d1 = d0 + 128u;
-            kv1  = _t4_elem(row, d1,       head_dim, n_rot);
-            kv1y = _t4_elem(row, d1 + 1u,  head_dim, n_rot);
-            kv1z = _t4_elem(row, d1 + 2u,  head_dim, n_rot);
-            kv1w = _t4_elem(row, d1 + 3u,  head_dim, n_rot);
+            kv1  = kv_smem[d1];
+            kv1y = kv_smem[d1 + 1u];
+            kv1z = kv_smem[d1 + 2u];
+            kv1w = kv_smem[d1 + 3u];
             uint32_t d2 = d0 + 256u;
-            kv2  = _t4_elem(row, d2,       head_dim, n_rot);
-            kv2y = _t4_elem(row, d2 + 1u,  head_dim, n_rot);
-            kv2z = _t4_elem(row, d2 + 2u,  head_dim, n_rot);
-            kv2w = _t4_elem(row, d2 + 3u,  head_dim, n_rot);
+            kv2  = kv_smem[d2];
+            kv2y = kv_smem[d2 + 1u];
+            kv2z = kv_smem[d2 + 2u];
+            kv2w = kv_smem[d2 + 3u];
             uint32_t d3 = d0 + 384u;
-            kv3  = _t4_elem(row, d3,       head_dim, n_rot);
-            kv3y = _t4_elem(row, d3 + 1u,  head_dim, n_rot);
-            kv3z = _t4_elem(row, d3 + 2u,  head_dim, n_rot);
-            kv3w = _t4_elem(row, d3 + 3u,  head_dim, n_rot);
+            kv3  = kv_smem[d3];
+            kv3y = kv_smem[d3 + 1u];
+            kv3z = kv_smem[d3 + 2u];
+            kv3w = kv_smem[d3 + 3u];
             dot  = q0.x*kv0  + q0.y*kv0y + q0.z*kv0z + q0.w*kv0w
                  + q1.x*kv1  + q1.y*kv1y + q1.z*kv1z + q1.w*kv1w
                  + q2.x*kv2  + q2.y*kv2y + q2.z*kv2z + q2.w*kv2w

@@ -92,7 +92,7 @@ rax.o: src/vendor/rax/rax.c src/vendor/rax/rax.h src/vendor/rax/rax_malloc.h
 	$(CC) $(CFLAGS) -c -o $@ src/vendor/rax/rax.c
 
 # ---- gpu (CUDA) ----
-ds4_cuda.o: src/gpu/ds4_cuda.cu src/gpu/ds4_cuda_common.h src/gpu/ds4_iq2_tables_cuda.inc src/gpu/ds4_cuda_embed.cuh src/gpu/ds4_cuda_matmul.cuh src/gpu/ds4_cuda_devutil.cuh src/gpu/ds4_cuda_q8.cuh src/gpu/ds4_cuda_norm.cuh src/gpu/ds4_cuda_rope.cuh src/gpu/ds4_cuda_attention.cuh src/gpu/ds4_cuda_hc.cuh src/gpu/ds4_cuda_compressor.cuh src/gpu/ds4_cuda_router.cuh src/gpu/ds4_cuda_indexer.cuh src/gpu/ds4_cuda_dispatch1.cuh src/gpu/ds4_cuda_dispatch2.cuh src/gpu/ds4_cuda_dispatch3.cuh src/gpu/ds4_cuda_quant.cuh src/gpu/ds4_cuda_moe.cuh src/gpu/ds4_cuda_moe_dispatch.cuh src/gpu/ds4_cuda_dispatch4.cuh
+ds4_cuda.o: src/gpu/ds4_cuda.cu src/gpu/ds4_cuda_common.h src/gpu/ds4_iq2_tables_cuda.inc src/gpu/ds4_cuda_embed.cuh src/gpu/ds4_cuda_matmul.cuh src/gpu/ds4_cuda_devutil.cuh src/gpu/ds4_cuda_q8.cuh src/gpu/ds4_cuda_norm.cuh src/gpu/ds4_cuda_rope.cuh src/gpu/ds4_cuda_attention.cuh src/gpu/ds4_cuda_hc.cuh src/gpu/ds4_cuda_compressor.cuh src/gpu/ds4_cuda_router.cuh src/gpu/ds4_cuda_indexer.cuh src/gpu/ds4_cuda_dispatch1.cuh src/gpu/ds4_cuda_dispatch2.cuh src/gpu/ds4_cuda_dispatch3.cuh src/gpu/ds4_cuda_quant.cuh src/gpu/ds4_cuda_moe.cuh src/gpu/ds4_cuda_moe_dispatch.cuh src/gpu/ds4_cuda_dispatch4.cuh src/gpu/turbo4_attention.cuh
 	$(NVCC) $(NVCCFLAGS) -c -o $@ src/gpu/ds4_cuda.cu
 
 ds4_turbo4.o: src/gpu/ds4_turbo4.cu src/gpu/ds4_cuda_common.h

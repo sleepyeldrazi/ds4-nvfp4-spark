@@ -57,3 +57,5 @@ dir-steering/out/
 .LSOverride
 *.swp
 *.swo
+
+GUIDE.md

@@ -226,3 +226,77 @@ extern "C" int ds4_gpu_dsv4_compressed_kv_quantize_tensor(
     (void)x; (void)n_tok; (void)head_dim; (void)n_rot;
     return 1;
 }
+
+/* Conditional pack kernel for decode-opt #5b: packs one comp row to turbo4
+ * format only at emit boundaries (((pos+1) % ratio) == 0).  At non-emit,
+ * returns without writing.  comp_row is computed from pos on-device.
+ * Keeps the turbo4 pack logic in ds4_turbo4.cu (same compilation unit as
+ * turbo4_pack_kernel) to avoid cross-file issues. */
+__global__ void turbo4_pack_conditional_kernel(
+        uint8_t *packed_base,    /* 0: turbo4 packed cache base */
+        const float *src_base,   /* 1: FP32 source cache base */
+        uint32_t comp_cap,       /* 2: capacity */
+        uint32_t head_dim,       /* 3 */
+        uint32_t n_rot,          /* 4 */
+        uint32_t ratio,          /* 5 */
+        uint32_t pos)            /* 6: DYNAMIC */
+{
+    if (((pos + 1u) % ratio) != 0u) return;
+    uint32_t comp_row = (pos + 1u) / ratio - 1u;
+    if (comp_row >= comp_cap) return;
+
+    uint32_t tid = threadIdx.x;
+    uint32_t n_nope = head_dim - n_rot;
+    uint32_t n_blocks = (n_nope + TURBO4_BLOCK - 1) / TURBO4_BLOCK;
+    const float *sr = src_base + (uint64_t)comp_row * head_dim;
+    uint8_t *dr = packed_base + (uint64_t)comp_row * turbo4_row_bytes(head_dim, n_rot);
+    uint8_t *nope_out = dr;
+    uint8_t *scale_out = dr + n_nope;
+    uint8_t *rot_out = scale_out + n_blocks + 1;
+
+    __shared__ float s_amax[64];
+    for (uint32_t blk = 0; blk < n_blocks; blk++) {
+        uint32_t base = blk * TURBO4_BLOCK;
+        float amax = 0.0f;
+        for (uint32_t i = tid; i < TURBO4_BLOCK && base + i < n_nope; i += blockDim.x) {
+            float v = fabsf(sr[base + i]);
+            if (v > amax) amax = v;
+        }
+        s_amax[tid] = amax;
+        __syncthreads();
+        for (uint32_t s = 32; s > 0; s >>= 1) {
+            if (tid < s) { float o = s_amax[tid + s]; if (o > s_amax[tid]) s_amax[tid] = o; }
+            __syncthreads();
+        }
+        float block_amax = s_amax[0];
+        __nv_fp8_e8m0 scale_e8m0(block_amax);
+        __nv_fp8_storage_t scale_byte = *reinterpret_cast<__nv_fp8_storage_t *>(&scale_e8m0);
+        if (tid == 0) scale_out[blk] = scale_byte;
+        float scale_val = (float)scale_e8m0;
+        if (scale_val == 0.0f) scale_val = 1.0f;
+        for (uint32_t i = tid; i < TURBO4_BLOCK && base + i < n_nope; i += blockDim.x) {
+            float v = sr[base + i] / scale_val;
+            __nv_fp8_e4m3 q(v);
+            nope_out[base + i] = *reinterpret_cast<__nv_fp8_storage_t *>(&q);
+        }
+        __syncthreads();
+    }
+    for (uint32_t i = tid; i < n_rot; i += blockDim.x) {
+        __nv_bfloat16 bf = __float2bfloat16(sr[n_nope + i]);
+        uint16_t *p = (uint16_t *)(rot_out + (uint64_t)i * 2);
+        p[0] = __bfloat16_as_ushort(bf);
+    }
+}
+
+/* Conditional pack dispatch: always launched, no-ops at non-emit. */
+extern "C" int ds4_gpu_turbo4_pack_conditional_tensor(
+        ds4_gpu_tensor *packed, const ds4_gpu_tensor *src,
+        uint32_t comp_cap, uint32_t head_dim, uint32_t n_rot,
+        uint32_t ratio, uint32_t pos) {
+    if (!packed || !src || ratio == 0) return 0;
+    turbo4_pack_conditional_kernel<<<1, 64, 0, g_launch_stream>>>(
+            (uint8_t *)packed->ptr,
+            (const float *)src->ptr,
+            comp_cap, head_dim, n_rot, ratio, pos);
+    return cuda_ok(cudaGetLastError(), "turbo4_pack_conditional launch");
+}

@@ -1664,6 +1664,13 @@ extern "C" void ds4_gpu_set_quality(bool quality) {
 #include "ds4_cuda_moe_dispatch.cuh"
 #include "ds4_cuda_dispatch4.cuh"
 
+/* Forward decl: turbo4_pack_conditional_kernel is defined in ds4_turbo4.cu
+ * (separate compilation unit) but referenced here for graph node classification. */
+__global__ void turbo4_pack_conditional_kernel(
+        uint8_t *packed_base, const float *src_base,
+        uint32_t comp_cap, uint32_t head_dim, uint32_t n_rot,
+        uint32_t ratio, uint32_t pos);
+
 /* turbo4 packed-attention dispatch: indexed mixed, reads comp_kv from
  * turbo4-packed format (e4m3 nope + e8m0 scale + BF16 rope). Raw KV is FP32.
  * Replaces the stub that returned 0 — now launches the real kernel. */
@@ -1761,6 +1768,15 @@ static int classify_dyn_kernel(void *func, dyn_arg_entry *out) {
     }
     if (func == (void *)attention_decode_mixed_kernel) {
         out[0] = {9, 3};  out[1] = {11, 4};  return 2;
+    }
+    if (func == (void *)compressor_emit_conditional_kernel) {
+        out[0] = {9, 0};  return 1;            /* pos0 (arg 9) */
+    }
+    if (func == (void *)compressor_store_kernel) {
+        out[0] = {9, 0};  return 1;            /* pos0 (arg 9) */
+    }
+    if (func == (void *)turbo4_pack_conditional_kernel) {
+        out[0] = {6, 0};  return 1;            /* pos (arg 6) */
     }
     return 0;
 }

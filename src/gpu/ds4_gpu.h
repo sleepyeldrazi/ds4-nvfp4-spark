@@ -50,6 +50,25 @@ int ds4_gpu_launch_graph(void *exec, void *stream);
 void ds4_gpu_destroy_exec(void *exec);
 void ds4_gpu_destroy_graph(void *graph);
 
+/* Fused conditional compressor emit (decode-opt #5b).  Always launched,
+ * no-ops at non-emit positions ((pos+1)%ratio != 0).  Handles update_pool +
+ * RMS norm + RoPE + turbo4 pack + state shift in one kernel. */
+int ds4_gpu_compressor_emit_conditional_tensor(
+        ds4_gpu_tensor *comp_cache, ds4_gpu_tensor *tq_cache,
+        ds4_gpu_tensor *state_kv, ds4_gpu_tensor *state_score,
+        const void *model_map, uint64_t model_size, uint64_t norm_offset,
+        uint32_t comp_cap, uint32_t head_dim, uint32_t n_rot,
+        uint32_t ratio, uint32_t pos,
+        float rms_eps, uint32_t n_ctx_orig,
+        float freq_base, float freq_scale, float ext_factor, float attn_factor,
+        float beta_fast, float beta_slow);
+
+/* Conditional turbo4 pack: always launched, no-ops at non-emit positions. */
+int ds4_gpu_turbo4_pack_conditional_tensor(
+        ds4_gpu_tensor *packed, const ds4_gpu_tensor *src,
+        uint32_t comp_cap, uint32_t head_dim, uint32_t n_rot,
+        uint32_t ratio, uint32_t pos);
+
 /* Graph dynamic-arg node update (decode-opt #5).  After capture, build an
  * update context that identifies which kernel nodes take per-token dynamic
  * args (pos, token, raw_row, n_raw, raw_start).  Before each replay, call

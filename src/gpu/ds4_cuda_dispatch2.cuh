@@ -177,6 +177,43 @@ extern "C" int ds4_gpu_compressor_store_batch_tensor(
     return cuda_ok(cudaGetLastError(), "compressor store launch");
 }
 
+/* Fused conditional emit: always launched, no-ops at non-emit positions.
+ * Replaces the CPU-gated if(emit) path for CUDA Graph capture (#5b). */
+extern "C" int ds4_gpu_compressor_emit_conditional_tensor(
+        ds4_gpu_tensor *comp_cache,       /* FP32 comp cache or unpack scratch */
+        ds4_gpu_tensor *tq_cache,         /* turbo4 packed cache (NULL if no turbo4) */
+        ds4_gpu_tensor *state_kv,
+        ds4_gpu_tensor *state_score,
+        const void *model_map, uint64_t model_size,
+        uint64_t norm_offset,
+        uint32_t comp_cap, uint32_t head_dim, uint32_t n_rot,
+        uint32_t ratio, uint32_t pos,
+        float rms_eps, uint32_t n_ctx_orig,
+        float freq_base, float freq_scale, float ext_factor, float attn_factor,
+        float beta_fast, float beta_slow) {
+    if (!comp_cache || !state_kv || !state_score || !model_map ||
+        head_dim == 0 || ratio == 0 || n_rot > head_dim ||
+        norm_offset > model_size ||
+        model_size - norm_offset < (uint64_t)head_dim * sizeof(float))
+        return 0;
+    const char *wptr = cuda_model_range_ptr(model_map, norm_offset,
+                                              (uint64_t)head_dim * sizeof(float), "comp_norm");
+    if (!wptr) return 0;
+    uint8_t *tq_base = NULL;
+    if (tq_cache) tq_base = (uint8_t *)tq_cache->ptr;
+    compressor_emit_conditional_kernel<<<1, 256, 0, g_launch_stream>>>(
+            (float *)comp_cache->ptr,
+            tq_base,
+            (float *)state_kv->ptr,
+            (float *)state_score->ptr,
+            (const float *)wptr,
+            comp_cap, head_dim, n_rot, ratio, pos,
+            rms_eps, n_ctx_orig,
+            freq_base, freq_scale, ext_factor, attn_factor,
+            beta_fast, beta_slow);
+    return cuda_ok(cudaGetLastError(), "compressor emit conditional launch");
+}
+
 extern "C" int ds4_gpu_compressor_update_tensor(
         const ds4_gpu_tensor *kv_cur,
         const ds4_gpu_tensor *sc_cur,

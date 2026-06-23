@@ -1506,50 +1506,42 @@ static bool gpu_graph_encode_decode_layer(
                                                      g->attn_norm, 1) != 0;
         }
         const uint32_t comp_row = g->layer_n_comp[il];
-        if (ok) ok = ds4_gpu_compressor_update_tensor(g->comp_kv_cur,
-                                                        g->comp_sc_cur,
-                                                        g->layer_attn_state_kv[il],
-                                                        g->layer_attn_state_score[il],
-                                                        attn_comp_write_cache,
-                                                        model->map,
-                                                        model->size,
-                                                        layer->attn_compressor_ape->abs_offset,
-                                                        layer->attn_compressor_ape->type,
-                                                        layer->attn_compressor_norm->abs_offset,
-                                                        layer->attn_compressor_norm->type,
-                                                        DS4_N_HEAD_DIM,
-                                                        ratio,
-                                                        pos,
-                                                        comp_row,
-                                                        DS4_N_ROT,
-                                                        compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
-                                                        freq_base,
-                                                        freq_scale,
-                                                        ext_factor,
-                                                        attn_factor,
-                                                        DS4_ROPE_YARN_BETA_FAST,
-                                                        DS4_ROPE_YARN_BETA_SLOW,
-                                                        DS4_RMS_EPS) != 0;
-        if (ok && emit) {
-            ds4_gpu_tensor *comp_row_view = ds4_gpu_tensor_view(
-                    attn_comp_write_cache,
-                    (uint64_t)comp_row * DS4_N_HEAD_DIM * sizeof(float),
-                    (uint64_t)DS4_N_HEAD_DIM * sizeof(float));
-            if (!comp_row_view) {
-                ok = false;
-            } else {
-                /* skip fp8 quantize for now - write float values directly */
-                (void)comp_row_view;
-                if (ok) {
-                    ok = gpu_graph_pack_attn_comp_rows(g, il, comp_row, 1);
-                }
-                if (ok) {
-                    gpu_graph_debug_dump_tensor("KVcompress", comp_row_view, DS4_N_HEAD_DIM, il, pos);
-                }
-                ds4_gpu_tensor_free(comp_row_view);
-            }
-        }
-        if (ok && emit) g->layer_n_comp[il]++;
+        /* Always run the store (writes current KV to rolling state) and the
+         * fused conditional emit (no-ops at non-emit positions).  This makes
+         * the decode tape graph-capturable for ALL tokens, not just non-emit
+         * (decode-opt #5b).  The emit_conditional kernel computes comp_row
+         * from pos on-device and handles update_pool + RMS norm + RoPE +
+         * turbo4 pack + state shift in one kernel. */
+        if (ok) ok = ds4_gpu_compressor_store_batch_tensor(g->comp_kv_cur,
+                                                              g->comp_sc_cur,
+                                                              g->layer_attn_state_kv[il],
+                                                              g->layer_attn_state_score[il],
+                                                              model->map,
+                                                              model->size,
+                                                              layer->attn_compressor_ape->abs_offset,
+                                                              layer->attn_compressor_ape->type,
+                                                              DS4_N_HEAD_DIM,
+                                                              ratio,
+                                                              pos,
+                                                              1) != 0;
+        if (ok) ok = ds4_gpu_compressor_emit_conditional_tensor(
+                attn_comp_write_cache,
+                g->turbo_packv4 ? g->layer_attn_comp_tq_cache[il] : NULL,
+                g->layer_attn_state_kv[il],
+                g->layer_attn_state_score[il],
+                model->map, model->size,
+                layer->attn_compressor_norm->abs_offset,
+                g->layer_comp_cap[il], DS4_N_HEAD_DIM, DS4_N_ROT,
+                ratio, pos, DS4_RMS_EPS,
+                compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
+                freq_base, freq_scale, ext_factor, attn_factor,
+                DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW) != 0;
+        if (ok && g->turbo_packv4) ok = ds4_gpu_turbo4_pack_conditional_tensor(
+                g->layer_attn_comp_tq_cache[il],
+                attn_comp_write_cache,
+                g->layer_comp_cap[il], DS4_N_HEAD_DIM, DS4_N_ROT,
+                ratio, pos) != 0;
+        (void)comp_row;  /* comp_row now computed on-device from pos */
 
         if (ok && ratio == 4) {
             const uint32_t index_width = coff * DS4_N_INDEXER_HEAD_DIM;
@@ -1591,34 +1583,36 @@ static bool gpu_graph_encode_decode_layer(
             }
             const uint32_t index_row = g->layer_n_index_comp[il];
             ds4_gpu_tensor *index_comp_write_cache = gpu_graph_index_comp_cache_for_write(g, il);
-            if (ok) ok = ds4_gpu_compressor_update_tensor(g->comp_kv_cur,
-                                                            g->comp_sc_cur,
-                                                            g->layer_index_state_kv[il],
-                                                            g->layer_index_state_score[il],
-                                                            index_comp_write_cache,
-                                                            model->map,
-                                                            model->size,
-                                                            layer->indexer_compressor_ape->abs_offset,
-                                                            layer->indexer_compressor_ape->type,
-                                                            layer->indexer_compressor_norm->abs_offset,
-                                                            layer->indexer_compressor_norm->type,
-                                                            DS4_N_INDEXER_HEAD_DIM,
-                                                            ratio,
-                                                            pos,
-                                                            index_row,
-                                                            DS4_N_ROT,
-                                                            compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
-                                                            freq_base,
-                                                            freq_scale,
-                                                            ext_factor,
-                                                            attn_factor,
-                                                            DS4_ROPE_YARN_BETA_FAST,
-                                                            DS4_ROPE_YARN_BETA_SLOW,
-                                                            DS4_RMS_EPS) != 0;
-            if (ok && emit && g->turbo_packv4) {
-                ok = gpu_graph_pack_index_comp_rows(g, il, index_row, 1);
-            }
-            if (ok && emit) g->layer_n_index_comp[il]++;
+            if (ok) ok = ds4_gpu_compressor_store_batch_tensor(g->comp_kv_cur,
+                                                                  g->comp_sc_cur,
+                                                                  g->layer_index_state_kv[il],
+                                                                  g->layer_index_state_score[il],
+                                                                  model->map,
+                                                                  model->size,
+                                                                  layer->indexer_compressor_ape->abs_offset,
+                                                                  layer->indexer_compressor_ape->type,
+                                                                  DS4_N_INDEXER_HEAD_DIM,
+                                                                  ratio,
+                                                                  pos,
+                                                                  1) != 0;
+            if (ok && index_comp_write_cache) ok = ds4_gpu_compressor_emit_conditional_tensor(
+                    index_comp_write_cache,
+                    g->turbo_packv4 ? g->layer_index_comp_tq_cache[il] : NULL,
+                    g->layer_index_state_kv[il],
+                    g->layer_index_state_score[il],
+                    model->map, model->size,
+                    layer->indexer_compressor_norm->abs_offset,
+                    g->layer_comp_cap[il], DS4_N_INDEXER_HEAD_DIM, DS4_N_ROT,
+                    ratio, pos, DS4_RMS_EPS,
+                    compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
+                    freq_base, freq_scale, ext_factor, attn_factor,
+                    DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW) != 0;
+            if (ok && g->turbo_packv4 && index_comp_write_cache) ok = ds4_gpu_turbo4_pack_conditional_tensor(
+                    g->layer_index_comp_tq_cache[il],
+                    index_comp_write_cache,
+                    g->layer_comp_cap[il], DS4_N_INDEXER_HEAD_DIM, DS4_N_ROT,
+                    ratio, pos) != 0;
+            (void)index_row;
             const uint32_t decode_top_k = gpu_graph_decode_indexer_top_k(g);
             if (ok && g->layer_n_comp[il] > decode_top_k) {
                 const uint64_t indexer_q_dim = (uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM;
@@ -4928,88 +4922,67 @@ static bool gpu_graph_eval_token_raw_swa(
     const bool use_graph = DS4_ENV_BOOL("DS4_CUDA_DECODE_GRAPH");
     const double t0 = profile ? now_sec() : 0.0;
 
-    /* ---- CUDA Graph capture/replay path (decode-opt #5) ----
-     * The decode tape is ~430 small kernel launches with ~98ms CPU dispatch
-     * and ~74ms GPU work.  Graph replay collapses the CPU dispatch into one
-     * cudaGraphLaunch (~0.3ms) + dynamic-arg node updates (~1ms).
+    /* ---- CUDA Graph capture/replay path (decode-opt #5 + #5b) ----
+     * The decode tape is ~430 small kernel launches.  Graph replay collapses
+     * the CPU dispatch into one cudaGraphLaunch + dynamic-arg node updates.
      *
-     * Strategy: capture at a non-emit pos, replay for subsequent non-emit
-     * tokens (3 of 4), manual dispatch at emit tokens (1 of 4, when the
-     * compressor emits and n_comp increments).  After each emit, recapture.
+     * With #5b (fused conditional emit kernel), the graph is valid for ALL
+     * tokens — the compressor emit work is device-conditional on
+     * ((pos+1)%ratio)==0, computed from the dynamic pos arg.  No more manual
+     * emit dispatch or recapture-every-4-tokens.
      *
      * Dynamic per-token args (pos, token, raw_row, n_raw, raw_start) are
-     * updated via cudaGraphExecKernelNodeSetParams before each replay.
-     * n_comp (per-layer, evolves at emit) is baked at capture time and stays
-     * correct between emits. */
+     * updated via cudaGraphExecKernelNodeSetParams before each replay. */
     if (use_graph && logits) {
-        /* Emit check: ratio-4 layers emit when (pos+1)%4==0.  ratio-128 emits
-         * are a subset (128%4==0).  So this single check covers all layers. */
-        const bool is_emit_pos = ((pos + 1u) & 3u) == 0u;
         const uint32_t raw_row = pos % g->raw_cap;
         const uint32_t n_raw = gpu_graph_raw_span_for_batch(g, pos, 1);
         const uint32_t raw_start = gpu_graph_raw_start_for_span(g, pos, n_raw);
 
-        if (is_emit_pos || !g->graph_captured) {
-            /* Emit token or first token: manual dispatch.  If non-emit,
-             * also capture a new graph for subsequent replays. */
-            if (!is_emit_pos) {
-                /* Non-emit, graph stale: capture a new graph.  The capture
-                 * records the 430 launches (CPU dispatch, ~5ms) then we
-                 * instantiate + launch to get logits. */
-                if (!g->graph_capture_stream)
-                    g->graph_capture_stream = ds4_gpu_create_stream();
-                if (g->graph_exec) { ds4_gpu_destroy_exec(g->graph_exec); g->graph_exec = NULL; }
-                if (g->graph_obj) { ds4_gpu_destroy_graph(g->graph_obj); g->graph_obj = NULL; }
-                if (g->graph_update_ctx) { ds4_gpu_graph_destroy_updates(g->graph_update_ctx); g->graph_update_ctx = NULL; }
-                g->graph_captured = 0;
-
-                if (g->graph_capture_stream) {
-                    ds4_gpu_set_launch_stream(g->graph_capture_stream);
-                    void *graph = NULL;
-                    bool cok = ds4_gpu_begin_capture(g->graph_capture_stream) != 0;
-                    if (cok) cok = gpu_graph_encode_token_raw_swa(g, model, weights,
-                                                                     token, pos, true, false);
-                    if (cok) cok = ds4_gpu_end_capture(g->graph_capture_stream, &graph) != 0;
-                    ds4_gpu_set_launch_stream(NULL);
-                    if (cok && graph) {
-                        cok = ds4_gpu_instantiate_graph(graph, &g->graph_exec) != 0;
-                        if (cok) g->graph_obj = graph;  /* keep graph for node queries */
-                        else ds4_gpu_destroy_graph(graph);
-                    }
-                    if (cok && g->graph_exec) {
-                        g->graph_update_ctx = ds4_gpu_graph_build_updates(g->graph_obj);
-                        g->graph_captured = 1;
-                        g->graph_capture_pos = pos;
-                    }
-                    if (cok && g->graph_captured) {
-                        /* Launch the captured graph to execute + get logits. */
-                        cok = ds4_gpu_graph_update_and_launch(
-                                g->graph_exec, g->graph_update_ctx,
-                                g->graph_capture_stream,
-                                pos, (uint32_t)token, raw_row, n_raw, raw_start) != 0;
-                        if (cok) cok = ds4_gpu_sync_stream(g->graph_capture_stream) != 0;
-                        if (cok) cok = ds4_gpu_tensor_read(g->logits, 0, logits,
-                                                            (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
-                    }
-                    if (profile)
-                        fprintf(stderr, "ds4: GPU graph CAPTURE+LAUNCH pos=%u %.3f ms\n",
-                                pos, (now_sec() - t0) * 1000.0);
-                    if (cok) return true;
-                    fprintf(stderr, "ds4: GPU graph capture failed, falling back to manual\n");
-                    /* fall through to manual */
+        if (!g->graph_captured) {
+            /* First token: capture the tape, instantiate, build update table,
+             * then launch to get logits.  The captured graph is valid for all
+             * subsequent tokens (emit + non-emit) thanks to the conditional
+             * emit kernel. */
+            if (!g->graph_capture_stream)
+                g->graph_capture_stream = ds4_gpu_create_stream();
+            if (!g->graph_capture_stream) {
+                fprintf(stderr, "ds4: GPU graph: failed to create capture stream\n");
+            } else {
+                ds4_gpu_set_launch_stream(g->graph_capture_stream);
+                void *graph = NULL;
+                bool cok = ds4_gpu_begin_capture(g->graph_capture_stream) != 0;
+                if (cok) cok = gpu_graph_encode_token_raw_swa(g, model, weights,
+                                                                 token, pos, true, false);
+                if (cok) cok = ds4_gpu_end_capture(g->graph_capture_stream, &graph) != 0;
+                ds4_gpu_set_launch_stream(NULL);
+                if (cok && graph) {
+                    cok = ds4_gpu_instantiate_graph(graph, &g->graph_exec) != 0;
+                    if (cok) g->graph_obj = graph;
+                    else ds4_gpu_destroy_graph(graph);
                 }
+                if (cok && g->graph_exec) {
+                    g->graph_update_ctx = ds4_gpu_graph_build_updates(g->graph_obj);
+                    g->graph_captured = 1;
+                    g->graph_capture_pos = pos;
+                }
+                if (cok && g->graph_captured) {
+                    cok = ds4_gpu_graph_update_and_launch(
+                            g->graph_exec, g->graph_update_ctx,
+                            g->graph_capture_stream,
+                            pos, (uint32_t)token, raw_row, n_raw, raw_start) != 0;
+                    if (cok) cok = ds4_gpu_sync_stream(g->graph_capture_stream) != 0;
+                    if (cok) cok = ds4_gpu_tensor_read(g->logits, 0, logits,
+                                                        (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+                }
+                if (profile)
+                    fprintf(stderr, "ds4: GPU graph CAPTURE+LAUNCH pos=%u %.3f ms\n",
+                            pos, (now_sec() - t0) * 1000.0);
+                if (cok) return true;
+                fprintf(stderr, "ds4: GPU graph capture failed, falling back to manual\n");
             }
-            /* Emit token or capture failed: manual dispatch. */
-            if (g->graph_captured) {
-                /* Graph is now stale (n_comp changed at emit).  Destroy it. */
-                ds4_gpu_destroy_exec(g->graph_exec); g->graph_exec = NULL;
-                ds4_gpu_destroy_graph(g->graph_obj); g->graph_obj = NULL;
-                ds4_gpu_graph_destroy_updates(g->graph_update_ctx); g->graph_update_ctx = NULL;
-                g->graph_captured = 0;
-            }
-            /* Fall through to manual dispatch below. */
+            /* fall through to manual on failure */
         } else {
-            /* Non-emit token with valid graph: replay with updated args. */
+            /* Subsequent tokens: replay with updated args. */
             bool rok = ds4_gpu_graph_update_and_launch(
                     g->graph_exec, g->graph_update_ctx,
                     g->graph_capture_stream,

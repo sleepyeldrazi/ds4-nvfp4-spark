@@ -1835,6 +1835,11 @@ extern "C" int ds4_gpu_graph_update_and_launch(
     ctx->vars[2] = raw_row;
     ctx->vars[3] = n_raw;
     ctx->vars[4] = raw_start;
+    /* Basic sanity: these should be reasonable for 1M ctx */
+    if (pos > 1048576u || raw_row > 10000u || n_raw > 10000u || raw_start > 10000u) {
+        fprintf(stderr, "ds4: GPU graph suspicious args: pos=%u tok=%u raw_row=%u n_raw=%u raw_start=%u\n",
+                pos, token, raw_row, n_raw, raw_start);
+    }
     for (int i = 0; i < ctx->n_nodes; i++) {
         cudaKernelNodeParams kp;
         if (cudaGraphKernelNodeGetParams(ctx->nodes[i].node, &kp) != cudaSuccess) {
@@ -1851,5 +1856,11 @@ extern "C" int ds4_gpu_graph_update_and_launch(
             return 0;
         }
     }
-    return cuda_ok(cudaGraphLaunch(exec, stream), "graph launch");
+    cudaError_t launch_err = cudaGraphLaunch(exec, stream);
+    if (launch_err != cudaSuccess) {
+        fprintf(stderr, "ds4: GPU graph launch failed at pos=%u: %s\n",
+                pos, cudaGetErrorString(launch_err));
+        return 0;
+    }
+    return 1;
 }

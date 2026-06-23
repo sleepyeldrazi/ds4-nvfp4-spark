@@ -4733,6 +4733,12 @@ struct server {
     FILE *trace;
     pthread_mutex_t trace_mu;
     uint64_t trace_seq;
+
+    /* When the live session is evicted, save the token IDs and disk path so
+     * a subsequent text-prefix cache miss can try token-prefix matching
+     * (resilient to chat-template re-rendering after tool calls). */
+    ds4_tokens last_evicted_tokens;
+    char *last_evicted_path;
 };
 
 /* Jobs are stack-owned by the client thread.  The worker signals completion
@@ -6045,7 +6051,13 @@ static bool kv_cache_store_live_prefix(server *s, const ds4_tokens *tokens,
 
 static void kv_cache_store_current(server *s, const char *reason) {
     const ds4_tokens *tokens = ds4_session_tokens(s->session);
-    if (tokens) kv_cache_store_live_prefix(s, tokens, tokens->len, reason);
+    if (tokens) {
+        kv_cache_store_live_prefix(s, tokens, tokens->len, reason);
+        if (!strcmp(reason, "evict")) {
+            ds4_tokens_free(&s->last_evicted_tokens);
+            tokens_copy_prefix(&s->last_evicted_tokens, tokens, tokens->len);
+        }
+    }
 }
 
 static void kv_cache_note_store(kv_disk_cache *kc, int tokens) {
@@ -6934,6 +6946,76 @@ done:
  * handled before generation: if the stable checkpoint is shorter than the full
  * prompt, we prefill to that boundary, store it, and immediately continue to the
  * real prompt.  The live graph therefore always moves forward. */
+
+/* Try to recover an evicted session via token-prefix matching.
+ *
+ * When the live session is evicted (reason=evict), we save its token sequence.
+ * If a subsequent text-prefix cache miss happens but the new prompt's TOKENS
+ * start with the saved sequence, we can reload the evicted checkpoint from disk
+ * and resume — even if the RENDERED TEXT has changed (e.g., tool-call results
+ * injected into the chat history).  The token sequence survives re-rendering
+ * when the actual conversation prefix is identical.
+ *
+ * Returns the number of cached tokens on success, 0 on failure. */
+static int kv_cache_try_load_evicted(server *s, const ds4_tokens *prompt) {
+    if (!s->last_evicted_tokens.v || s->last_evicted_tokens.len <= 0) return 0;
+    if (!prompt || prompt->len < s->last_evicted_tokens.len) return 0;
+
+    /* Token-prefix check: the first N tokens must match exactly. */
+    int n = s->last_evicted_tokens.len;
+    for (int i = 0; i < n; i++) {
+        if (prompt->v[i] != s->last_evicted_tokens.v[i]) return 0;
+    }
+
+    /* Render the saved tokens to find their disk-cache file. */
+    size_t text_len = 0;
+    char *text = render_tokens_text(s->engine, &s->last_evicted_tokens, &text_len);
+    if (!text || text_len == 0) { free(text); return 0; }
+    char sha[41];
+    sha1_bytes_hex(text, text_len, sha);
+    char *path = kv_path_for_sha(&s->kv, sha);
+    free(text);
+    if (!path) return 0;
+
+    /* Check if the file still exists and is compatible. */
+    FILE *fp = fopen(path, "rb");
+    if (!fp) { free(path); return 0; }
+    kv_entry hdr = {0};
+    uint32_t text_bytes = 0;
+    if (!kv_read_header(fp, &hdr, &text_bytes) ||
+        hdr.quant_bits != (uint8_t)ds4_engine_routed_quant_bits(s->engine) ||
+        hdr.tokens != (uint32_t)n) {
+        fclose(fp); free(path); return 0;
+    }
+
+    /* Skip the text portion of the file (already validated via sha1). */
+    fseek(fp, (long)text_bytes, SEEK_CUR);
+
+    /* Load the KV payload into the session. */
+    char err[160] = {0};
+    int loaded = 0;
+    if (ds4_session_load_payload(s->session, fp, hdr.payload_bytes, err, sizeof(err)) == 0) {
+        const ds4_tokens *loaded_tokens = ds4_session_tokens(s->session);
+        if (loaded_tokens && loaded_tokens->len == (int)hdr.tokens)
+            loaded = (int)hdr.tokens;
+        else
+            ds4_session_invalidate(s->session);
+    } else {
+        ds4_session_invalidate(s->session);
+    }
+    fclose(fp);
+
+    if (loaded > 0) {
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: kv cache hit evicted tokens=%d text=%u load=%.1f ms file=%s",
+                   loaded, text_bytes, 0.0, path);
+        free(path);
+        return loaded;
+    }
+    free(path);
+    return 0;
+}
+
 static void generate_job(server *s, job *j) {
     char err[160];
     err[0] = '\0';
@@ -6972,6 +7054,16 @@ static void generate_job(server *s, job *j) {
             cached = disk_cached;
             cache_source = "disk-text";
             prompt_for_sync = &effective_prompt;
+        }
+    }
+    if (cached == 0 && s->last_evicted_tokens.len > 0) {
+        int evicted_cached = kv_cache_try_load_evicted(s, &j->req.prompt);
+        if (evicted_cached > 0) {
+            cached = evicted_cached;
+            cache_source = "disk-evicted";
+            /* prompt_for_sync stays as the full original prompt so
+             * ds4_session_sync() detects the common prefix and only
+             * prefills the suffix. */
         }
     }
     const int prompt_tokens = prompt_for_sync->len;
@@ -7866,6 +7958,8 @@ static void server_close_resources(server *s) {
         s->trace = NULL;
     }
     kv_cache_close(&s->kv);
+    ds4_tokens_free(&s->last_evicted_tokens);
+    free(s->last_evicted_path);
     tool_memory_free(&s->tool_mem);
     pthread_mutex_destroy(&s->tool_mu);
     pthread_mutex_destroy(&s->trace_mu);
